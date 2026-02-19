@@ -992,7 +992,7 @@ Resources:
       Description: Step 1 - Run once to create the Athena database
       Database: default
       QueryString: !Sub |
-        CREATE DATABASE IF NOT EXISTS `${AWS::StackName}_db`
+        CREATE SCHEMA IF NOT EXISTS `${AWS::StackName}_db`
         COMMENT 'DynamoDB GSI export data - managed by ${AWS::StackName}';
 
   AthenaCreateTableQuery:
@@ -1242,7 +1242,7 @@ Resources:
 
                   if rt in ('Create', 'Update'):
                       run_ddl(
-                          f"CREATE DATABASE IF NOT EXISTS"
+                          f"CREATE SCHEMA IF NOT EXISTS"
                           f" {db}")
 
                       loc = LOCATION
