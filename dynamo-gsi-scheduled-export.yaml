@@ -539,7 +539,7 @@ Resources:
               # Ensure all object columns are strings (Parquet compatibility)
               for col in df.columns:
                   if df[col].dtype == object:
-                      df[col] = df[col].astype(str).replace('None', None)
+                      df[col] = df[col].astype(str).replace({'None': None, 'nan': None, 'NaN': None})
 
               s3_path = f"s3://{S3_BUCKET}/{s3_key}"
               wr.s3.to_parquet(df=df, path=s3_path, index=False, compression='snappy')
@@ -1078,7 +1078,7 @@ Resources:
               # Ensure all object columns are strings (Parquet compatibility)
               for col in df.columns:
                   if df[col].dtype == object:
-                      df[col] = df[col].astype(str).replace('None', None)
+                      df[col] = df[col].astype(str).replace({'None': None, 'nan': None, 'NaN': None})
 
               s3_path = f"s3://{S3_BUCKET}/{s3_key}"
 
