@@ -1115,14 +1115,17 @@ Resources:
                   - glue:CreateDatabase
                   - glue:DeleteDatabase
                   - glue:GetDatabase
+                  - glue:GetDatabases
                   - glue:CreateTable
                   - glue:DeleteTable
                   - glue:GetTable
+                  - glue:GetTables
                   - glue:GetPartitions
+                  - glue:UpdateTable
                 Resource:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}_db'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}_db/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
               - Sid: S3Results
                 Effect: Allow
                 Action:
@@ -1370,13 +1373,15 @@ Resources:
                 Effect: Allow
                 Action:
                   - glue:GetDatabase
+                  - glue:GetDatabases
                   - glue:GetTable
+                  - glue:GetTables
                   - glue:GetPartitions
                   - glue:GetPartition
                 Resource:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}_db'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}_db/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
               - Sid: S3DataRead
                 Effect: Allow
                 Action:
