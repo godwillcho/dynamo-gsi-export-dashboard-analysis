@@ -313,6 +313,32 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Sid: AthenaSchemaSync
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-workgroup'
+              - Sid: GlueSchemaSync
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+              - Sid: S3AthenaResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results/*'
 
   OnDemandExportLogGroup:
     Type: AWS::Logs::LogGroup
@@ -343,6 +369,8 @@ Resources:
           S3_BUCKET:         !Ref S3BucketName
           S3_PREFIX:         !Ref S3DataPrefix
           EXTRA_DATE_COLUMN: !Ref ExtraDateColumn
+          ATHENA_DATABASE:   !Sub '${AWS::StackName}_db'
+          ATHENA_WORKGROUP:  !Ref AthenaWorkgroup
           LOG_LEVEL:         'INFO'
       Code:
         ZipFile: |
@@ -492,6 +520,47 @@ Resources:
               logger.info("Wrote %d row(s) to %s", len(df), s3_path)
 
 
+          def sync_athena_schema(all_columns):
+              """Add any new columns to the Athena table."""
+              try:
+                  athena_client = boto3.client('athena')
+                  db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
+                  wg = os.environ.get('ATHENA_WORKGROUP', '')
+                  if not db or not wg:
+                      return
+                  # Get current table columns
+                  glue = boto3.client('glue')
+                  resp = glue.get_table(DatabaseName=db, Name='gsi_export')
+                  existing = {c['Name'].lower() for c in
+                              resp['Table']['StorageDescriptor']['Columns']}
+                  # Partition cols to exclude
+                  existing.update({'year', 'month', 'day'})
+                  # Find new columns
+                  new_cols = []
+                  for col, dtype in all_columns.items():
+                      if col.lower() not in existing:
+                          new_cols.append(f'{col.lower()} {dtype}')
+                  if new_cols:
+                      ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
+                             f"({', '.join(new_cols)})")
+                      logger.info("Adding %d new columns: %s", len(new_cols), new_cols)
+                      r = athena_client.start_query_execution(
+                          QueryString=ddl, WorkGroup=wg)
+                      qid = r['QueryExecutionId']
+                      import time as _time
+                      for _ in range(30):
+                          _time.sleep(1)
+                          ex = athena_client.get_query_execution(QueryExecutionId=qid)
+                          st = ex['QueryExecution']['Status']['State']
+                          if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                              break
+                      logger.info("ALTER TABLE result: %s", st)
+                  else:
+                      logger.info("Athena schema up to date — no new columns")
+              except Exception as e:
+                  logger.warning("Schema sync failed (non-fatal): %s", e)
+
+
           def handler(event, context):
               request_id = getattr(context, 'aws_request_id', 'local')
               logger.info("On-demand export — request_id=%s table=%s gsi=%s",
@@ -548,6 +617,20 @@ Resources:
 
               logger.info("Export complete — %d item(s), %d file(s)",
                           len(items), len(s3_keys))
+
+              # Sync Athena schema with all discovered columns
+              all_cols = {}
+              for item in items:
+                  for k, v in item.items():
+                      if k not in all_cols:
+                          from decimal import Decimal as _Dec
+                          if isinstance(v, (int, float, _Dec)):
+                              all_cols[k] = 'DOUBLE'
+                          else:
+                              all_cols[k] = 'STRING'
+              if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
+                  all_cols[EXTRA_DATE_COL] = 'STRING'
+              sync_athena_schema(all_cols)
 
               return {
                   'statusCode': 200,
@@ -655,6 +738,32 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Sid: AthenaSchemaSync
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-workgroup'
+              - Sid: GlueSchemaSync
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+              - Sid: S3AthenaResults
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results/*'
 
   # -------------------------------------------------------------------------
   # 3. CloudWatch Log Group
@@ -702,6 +811,8 @@ Resources:
           S3_PREFIX:               !Ref S3DataPrefix
           OVERWRITE_MODE:          !Ref OverwriteMode
           EXTRA_DATE_COLUMN:       !Ref ExtraDateColumn
+          ATHENA_DATABASE:         !Sub '${AWS::StackName}_db'
+          ATHENA_WORKGROUP:        !Ref AthenaWorkgroup
           LOG_LEVEL:               'INFO'
       Code:
         ZipFile: |
@@ -929,6 +1040,43 @@ Resources:
               logger.info("Wrote %d row(s) to %s", len(df), s3_path)
 
 
+          def sync_athena_schema(all_columns):
+              """Add any new columns to the Athena table."""
+              try:
+                  athena_client = boto3.client('athena')
+                  db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
+                  wg = os.environ.get('ATHENA_WORKGROUP', '')
+                  if not db or not wg:
+                      return
+                  glue = boto3.client('glue')
+                  resp = glue.get_table(DatabaseName=db, Name='gsi_export')
+                  existing = {c['Name'].lower() for c in
+                              resp['Table']['StorageDescriptor']['Columns']}
+                  existing.update({'year', 'month', 'day'})
+                  new_cols = []
+                  for col, dtype in all_columns.items():
+                      if col.lower() not in existing:
+                          new_cols.append(f'{col.lower()} {dtype}')
+                  if new_cols:
+                      ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
+                             f"({', '.join(new_cols)})")
+                      logger.info("Adding %d new columns: %s", len(new_cols), new_cols)
+                      r = athena_client.start_query_execution(
+                          QueryString=ddl, WorkGroup=wg)
+                      qid = r['QueryExecutionId']
+                      for _ in range(30):
+                          time.sleep(1)
+                          ex = athena_client.get_query_execution(QueryExecutionId=qid)
+                          st = ex['QueryExecution']['Status']['State']
+                          if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                              break
+                      logger.info("ALTER TABLE result: %s", st)
+                  else:
+                      logger.info("Athena schema up to date — no new columns")
+              except Exception as e:
+                  logger.warning("Schema sync failed (non-fatal): %s", e)
+
+
           # ── handler ───────────────────────────────────────────────────────
 
           def lambda_handler(event, context):
@@ -939,6 +1087,20 @@ Resources:
               items  = query_gsi(start_dt, end_dt)
               s3_key = build_s3_key(start_dt, end_dt)
               write_parquet(items, s3_key)
+
+              # Sync Athena schema with discovered columns
+              all_cols = {}
+              for item in items:
+                  for k, v in item.items():
+                      if k not in all_cols:
+                          from decimal import Decimal as _Dec
+                          if isinstance(v, (int, float, _Dec)):
+                              all_cols[k] = 'DOUBLE'
+                          else:
+                              all_cols[k] = 'STRING'
+              if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
+                  all_cols[EXTRA_DATE_COL] = 'STRING'
+              sync_athena_schema(all_cols)
 
               logger.info("Invocation complete — request_id=%s items=%d s3_key=%s",
                           request_id, len(items), s3_key)
@@ -1148,6 +1310,14 @@ Resources:
                   - s3:ListBucket
                 Resource:
                   - !Sub 'arn:aws:s3:::${S3BucketName}'
+              - Sid: DynamoDBScan
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}/index/${GsiName}'
 
   AthenaSetupLogGroup:
     Type: AWS::Logs::LogGroup
@@ -1171,6 +1341,11 @@ Resources:
           ATHENA_WORKGROUP: !Ref AthenaWorkgroup
           TABLE_LOCATION: !Sub 's3://${S3BucketName}/${S3DataPrefix}/'
           YEAR_RANGE: !Ref ProjectionYearRange
+          DYNAMO_TABLE_NAME: !Ref DynamoTableName
+          GSI_NAME: !Ref GsiName
+          GSI_PK_ATTRIBUTE: !Ref GsiPartitionKeyAttribute
+          GSI_PK_VALUE: !Ref GsiPartitionKeyValue
+          EXTRA_DATE_COLUMN: !Ref ExtraDateColumn
       Code:
         ZipFile: |
           """
@@ -1183,6 +1358,7 @@ Resources:
           import json
           import logging
           import urllib.request
+          from decimal import Decimal
 
           import boto3
 
@@ -1190,11 +1366,59 @@ Resources:
           logger.setLevel('INFO')
 
           athena = boto3.client('athena')
+          dynamodb = boto3.resource('dynamodb')
 
           DATABASE  = os.environ['ATHENA_DATABASE'].replace('-', '_')
           WORKGROUP = os.environ['ATHENA_WORKGROUP']
           LOCATION  = os.environ['TABLE_LOCATION']
           YR_RANGE  = os.environ['YEAR_RANGE']
+          TABLE_NAME      = os.environ['DYNAMO_TABLE_NAME']
+          GSI_NAME        = os.environ['GSI_NAME']
+          GSI_PK_ATTR     = os.environ['GSI_PK_ATTRIBUTE']
+          GSI_PK_VALUE    = os.environ['GSI_PK_VALUE']
+          EXTRA_DATE_COL  = os.environ.get('EXTRA_DATE_COLUMN', '')
+
+
+          def discover_columns():
+              """Scan DynamoDB GSI for a sample of items to discover all attribute names."""
+              table = dynamodb.Table(TABLE_NAME)
+              from boto3.dynamodb.conditions import Key
+              all_attrs = {}
+              try:
+                  resp = table.query(
+                      IndexName=GSI_NAME,
+                      KeyConditionExpression=Key(GSI_PK_ATTR).eq(GSI_PK_VALUE),
+                      Limit=200,
+                  )
+                  items = resp.get('Items', [])
+                  # Also try to get more diversity with a second page
+                  if resp.get('LastEvaluatedKey'):
+                      resp2 = table.query(
+                          IndexName=GSI_NAME,
+                          KeyConditionExpression=Key(GSI_PK_ATTR).eq(GSI_PK_VALUE),
+                          ExclusiveStartKey=resp['LastEvaluatedKey'],
+                          Limit=200,
+                      )
+                      items.extend(resp2.get('Items', []))
+
+                  for item in items:
+                      for k, v in item.items():
+                          if k not in all_attrs:
+                              if isinstance(v, (int, float, Decimal)):
+                                  all_attrs[k] = 'DOUBLE'
+                              else:
+                                  all_attrs[k] = 'STRING'
+
+                  logger.info("Discovered %d columns from %d items: %s",
+                              len(all_attrs), len(items), list(all_attrs.keys()))
+              except Exception as e:
+                  logger.warning("Column discovery failed: %s", e)
+
+              # Add extra date column if configured
+              if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_attrs:
+                  all_attrs[EXTRA_DATE_COL] = 'STRING'
+
+              return all_attrs
 
 
           def run_ddl(sql):
@@ -1257,30 +1481,32 @@ Resources:
 
                       loc = LOCATION
                       yr = YR_RANGE
+
+                      # Discover columns dynamically from DynamoDB
+                      cols = discover_columns()
+                      if not cols:
+                          # Fallback: minimal schema
+                          cols = {'contactid': 'STRING', 'report_date': 'STRING'}
+                          logger.warning("No columns discovered, using fallback schema")
+
+                      # Partition columns must not be in the main column list
+                      for pc in ('year', 'month', 'day'):
+                          cols.pop(pc, None)
+
+                      col_defs = ',\n            '.join(
+                          f'{k.lower()} {v}' for k, v in cols.items())
+                      logger.info("Creating table with %d columns", len(cols))
+
+                      # Drop existing table first to refresh schema
+                      try:
+                          run_ddl(f"DROP TABLE IF EXISTS {db}.gsi_export")
+                      except Exception:
+                          pass
+
                       run_ddl(f"""
           CREATE EXTERNAL TABLE IF NOT EXISTS
           {db}.gsi_export (
-            initialcontactid STRING,
-            agentid STRING,
-            agentname STRING,
-            agentusername STRING,
-            channel STRING,
-            connectedtoagenttimestamp STRING,
-            connectedtosystemtimestamp STRING,
-            contactid STRING,
-            createdat STRING,
-            customerendpointaddress STRING,
-            describedcontactid STRING,
-            initiationmethod STRING,
-            initiationtimestamp STRING,
-            lastupdatetimestamp STRING,
-            originalcontactchannel STRING,
-            previouscontactid STRING,
-            relatedcontactid STRING,
-            systemendpointaddress STRING,
-            ttl DOUBLE,
-            viewaction STRING,
-            report_date STRING
+            {col_defs}
           )
           PARTITIONED BY (year INT, month INT, day INT)
           STORED AS PARQUET
