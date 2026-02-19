@@ -24,7 +24,7 @@ from botocore.exceptions import ClientError
 # ---------------------------------------------------------------------------
 STACK_NAME = "gsi-export-test"
 TEMPLATE_FILE = "dynamo-gsi-scheduled-export.yaml"
-S3_STAGING_BUCKET = f"cfn-templates-{boto3.client('sts').get_caller_identity()['Account']}"
+REGION = "us-east-1"  # Set explicitly; change to your preferred region
 
 PARAMETERS = {
     "DynamoTableName":          "ConnectViewDataTest",
@@ -48,26 +48,35 @@ PARAMETERS = {
 S3_BUCKET_NAME = ""
 
 CAPABILITIES = ["CAPABILITY_NAMED_IAM"]
-REGION = None  # None = use default from AWS config
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _region_kwargs():
+    return {"region_name": REGION} if REGION else {}
+
+def get_account_id():
+    sts = boto3.client("sts", **_region_kwargs())
+    return sts.get_caller_identity()["Account"]
+
+def get_staging_bucket():
+    return f"cfn-templates-{get_account_id()}"
+
 def get_clients():
-    kwargs = {"region_name": REGION} if REGION else {}
+    kwargs = _region_kwargs()
     cfn = boto3.client("cloudformation", **kwargs)
     s3 = boto3.client("s3", **kwargs)
     return cfn, s3
 
 
-def ensure_staging_bucket(s3):
+def ensure_staging_bucket(s3, bucket):
     try:
-        s3.head_bucket(Bucket=S3_STAGING_BUCKET)
-        print(f"  Staging bucket exists: {S3_STAGING_BUCKET}")
+        s3.head_bucket(Bucket=bucket)
+        print(f"  Staging bucket exists: {bucket}")
     except ClientError:
-        print(f"  Creating staging bucket: {S3_STAGING_BUCKET}")
-        kwargs = {"Bucket": S3_STAGING_BUCKET}
+        print(f"  Creating staging bucket: {bucket}")
+        kwargs = {"Bucket": bucket}
         region = s3.meta.region_name
         if region and region != "us-east-1":
             kwargs["CreateBucketConfiguration"] = {
@@ -76,12 +85,12 @@ def ensure_staging_bucket(s3):
         s3.create_bucket(**kwargs)
 
 
-def upload_template(s3):
+def upload_template(s3, bucket):
     key = f"{STACK_NAME}/template.yaml"
-    print(f"  Uploading template to s3://{S3_STAGING_BUCKET}/{key}")
+    print(f"  Uploading template to s3://{bucket}/{key}")
     with open(TEMPLATE_FILE, "rb") as f:
-        s3.put_object(Bucket=S3_STAGING_BUCKET, Key=key, Body=f.read())
-    return f"https://{S3_STAGING_BUCKET}.s3.amazonaws.com/{key}"
+        s3.put_object(Bucket=bucket, Key=key, Body=f.read())
+    return f"https://{bucket}.s3.amazonaws.com/{key}"
 
 
 def build_params():
@@ -89,8 +98,7 @@ def build_params():
     if S3_BUCKET_NAME:
         params["S3BucketName"] = S3_BUCKET_NAME
     else:
-        account = boto3.client("sts").get_caller_identity()["Account"]
-        params["S3BucketName"] = f"{STACK_NAME}-{account}"
+        params["S3BucketName"] = f"{STACK_NAME}-{get_account_id()}"
     return [
         {"ParameterKey": k, "ParameterValue": str(v)}
         for k, v in params.items()
@@ -166,8 +174,9 @@ def cmd_deploy():
     cfn, s3 = get_clients()
     print(f"\nDeploying stack: {STACK_NAME}")
 
-    ensure_staging_bucket(s3)
-    template_url = upload_template(s3)
+    staging_bucket = get_staging_bucket()
+    ensure_staging_bucket(s3, staging_bucket)
+    template_url = upload_template(s3, staging_bucket)
     params = build_params()
 
     exists = stack_exists(cfn)
