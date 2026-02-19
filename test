@@ -1,1 +1,28 @@
-{"Message":"Forbidden. For troubleshooting Function URL authorization issues, see: https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html"}
+$ aws lambda get-policy --function-name gsi-dynamodb-athena-report-query --region us-east-1 2>&1
+{
+    "Policy": "{\"Version\":\"2012-10-17\",\"Id\":\"default\",\"Statement\":[{\"Sid\":\"gsi-dynamodb-athena-ReportDashboardUrlPermission-zQMb1RWvnclq\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"lambda:InvokeFunctionUrl\",\"Resource\":\"arn:aws:lambda:us-east-1:490004638518:function:gsi-dynamodb-athena-report-query\",\"Condition\":{\"StringEquals\":{\"lambda:FunctionUrlAuthType\":\"NONE\"}}}]}",
+    "RevisionId": "3b9130c9-8473-40b6-8050-518cd75f8754"
+}
+
+DOMAIN+godwill.cho@SWO3K79325073GT MINGW64 ~/OneDrive - SoftwareOne/Desktop/CLH_DYNAMODB_S3_ATHENA/dynamo-gsi-export-dashboard-analysis (main)
+$ aws lambda get-function-url-config --function-name gsi-dynamodb-athena-report-query --region us-east-1
+{
+    "FunctionUrl": "https://6nqkvyrqrlje7tpqvj35qfnxgq0vdqik.lambda-url.us-east-1.on.aws/",
+    "FunctionArn": "arn:aws:lambda:us-east-1:490004638518:function:gsi-dynamodb-athena-report-query",
+    "AuthType": "NONE",
+    "Cors": {
+        "AllowHeaders": [
+            "content-type"
+        ],
+        "AllowMethods": [
+            "GET",
+            "POST"
+        ],
+        "AllowOrigins": [
+            "*"
+        ]
+    },
+    "CreationTime": "2026-02-19T03:21:52.517041380Z",
+    "LastModifiedTime": "2026-02-19T03:21:52.517041380Z",
+    "InvokeMode": "BUFFERED"
+}
