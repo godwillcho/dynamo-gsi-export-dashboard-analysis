@@ -381,6 +381,7 @@ Resources:
           a specific range, or {} to export all data for the GSI PK value.
           """
           import os
+          import json
           import logging
           import uuid
           from datetime import datetime, date, timedelta, timezone
@@ -491,22 +492,41 @@ Resources:
                   return None
 
 
+          def flatten_value(v):
+              """Convert DynamoDB complex types to strings for Parquet compatibility."""
+              if v is None:
+                  return None
+              if isinstance(v, (dict, list, set, frozenset)):
+                  return json.dumps(v, default=str)
+              if hasattr(v, 'as_tuple'):  # Decimal
+                  return float(v)
+              return v
+
           def write_parquet(items: list[dict], s3_key: str) -> None:
               if not items:
                   logger.warning("No items — skipping S3 upload.")
                   return
 
-              df = pd.DataFrame(items)
-              df.columns = [c.lower() for c in df.columns]
+              # Flatten all complex DynamoDB types (Maps, Lists, Sets)
+              flat_items = []
+              for item in items:
+                  flat = {}
+                  for k, v in item.items():
+                      flat[k.lower()] = flatten_value(v)
+                  flat_items.append(flat)
+
+              df = pd.DataFrame(flat_items)
 
               # Add extra date column derived from GSI sort key
-              if EXTRA_DATE_COL and GSI_SK_ATTR.lower() in df.columns:
-                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR.lower()].apply(sk_to_date)
+              sk_col = GSI_SK_ATTR.lower()
+              if EXTRA_DATE_COL and sk_col in df.columns:
+                  df[EXTRA_DATE_COL] = df[sk_col].apply(sk_to_date)
                   logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
 
               logger.info("DataFrame: %d rows, %d cols: %s",
                           len(df), len(df.columns), list(df.columns))
 
+              # Cast remaining Decimal values to float
               for col in df.columns:
                   if df[col].dtype == object:
                       try:
@@ -515,6 +535,11 @@ Resources:
                           )
                       except Exception:
                           logger.debug("Could not cast column '%s'", col)
+
+              # Ensure all object columns are strings (Parquet compatibility)
+              for col in df.columns:
+                  if df[col].dtype == object:
+                      df[col] = df[col].astype(str).replace('None', None)
 
               s3_path = f"s3://{S3_BUCKET}/{s3_key}"
               wr.s3.to_parquet(df=df, path=s3_path, index=False, compression='snappy')
@@ -822,6 +847,7 @@ Resources:
           sort key, then writes the result as Parquet to S3 for Athena.
           """
           import os
+          import json
           import logging
           import uuid
           from datetime import datetime, timedelta, timezone
@@ -1004,18 +1030,36 @@ Resources:
                   return None
 
 
+          def flatten_value(v):
+              """Convert DynamoDB types for Parquet compatibility."""
+              if v is None:
+                  return None
+              if isinstance(v, (dict, list, set, frozenset)):
+                  return json.dumps(v, default=str)
+              if hasattr(v, 'as_tuple'):  # Decimal
+                  return float(v)
+              return v
+
           def write_parquet(items: list[dict], s3_key: str) -> None:
               """Convert items to a DataFrame and upload as Parquet via awswrangler."""
               if not items:
                   logger.warning("No items to write — skipping S3 upload.")
                   return
 
-              df = pd.DataFrame(items)
-              df.columns = [c.lower() for c in df.columns]
+              # Flatten all values and lowercase column names
+              flat_items = []
+              for item in items:
+                  flat = {}
+                  for k, v in item.items():
+                      flat[k.lower()] = flatten_value(v)
+                  flat_items.append(flat)
+
+              df = pd.DataFrame(flat_items)
 
               # Add extra date column derived from GSI sort key
-              if EXTRA_DATE_COL and GSI_SK_ATTR.lower() in df.columns:
-                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR.lower()].apply(sk_to_date)
+              sk_col = GSI_SK_ATTR.lower()
+              if EXTRA_DATE_COL and sk_col in df.columns:
+                  df[EXTRA_DATE_COL] = df[sk_col].apply(sk_to_date)
                   logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
 
               logger.info("DataFrame created — %d row(s), %d column(s): %s",
@@ -1030,6 +1074,11 @@ Resources:
                           )
                       except Exception:
                           logger.debug("Could not cast column '%s' from Decimal", col)
+
+              # Ensure all object columns are strings (Parquet compatibility)
+              for col in df.columns:
+                  if df[col].dtype == object:
+                      df[col] = df[col].astype(str).replace('None', None)
 
               s3_path = f"s3://{S3_BUCKET}/{s3_key}"
 
