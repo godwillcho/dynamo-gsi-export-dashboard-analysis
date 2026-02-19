@@ -174,6 +174,11 @@ Parameters:
     Default: 14
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
 
+  MaxFetchRows:
+    Type: Number
+    Default: 20000
+    Description: Maximum number of rows the dashboard API will return per query.
+
 # ---------------------------------------------------------------------------
 # Conditions
 # ---------------------------------------------------------------------------
@@ -1426,6 +1431,7 @@ Resources:
           ATHENA_DATABASE: !Sub '${AWS::StackName}_db'
           ATHENA_TABLE: gsi_export
           ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          MAX_ROWS: !Ref MaxFetchRows
           LOG_LEVEL: 'INFO'
       Code:
         ZipFile: |
@@ -1443,6 +1449,7 @@ Resources:
           DATABASE  = os.environ['ATHENA_DATABASE'].replace('-', '_')
           TABLE     = os.environ['ATHENA_TABLE']
           WORKGROUP = os.environ['ATHENA_WORKGROUP']
+          MAX_ROWS  = int(os.environ.get('MAX_ROWS', '20000'))
           TBL       = f'{DATABASE}.{TABLE}'
 
           athena = boto3.client('athena')
@@ -1492,7 +1499,9 @@ Resources:
                   Params={'Bucket':p.netloc,'Key':p.path.lstrip('/')},
                   ExpiresIn=expiry)
 
-          def fetch_rows(qid, max_rows=20000):
+          def fetch_rows(qid, max_rows=None):
+              if max_rows is None:
+                  max_rows = MAX_ROWS
               rows, cols, kwargs = [], None, {
                   'QueryExecutionId':qid,'MaxResults':1000}
               while len(rows) < max_rows:
@@ -1861,7 +1870,7 @@ Resources:
           </div>
           <div class="sql-example" onclick="loadSqlExample()" title="Click to load into editor">SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date FROM gsi_export_test_db.gsi_export WHERE report_date >= '2025-01-01' ORDER BY report_date DESC LIMIT 50</div>
           </div>
-          <label>Limit<input type="number" id="f-limit" value="1000" min="1" max="10000"
+          <label>Limit<input type="number" id="f-limit" value="1000" min="1" max="20000"
           style="width:80px"></label>
           <button class="btn btn-blue" id="run-btn">Run Query</button>
           </div>
