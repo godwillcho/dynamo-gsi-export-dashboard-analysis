@@ -1,83 +1,28 @@
 $ python deploy.py deploy
+
+Deploying stack: gsi-export-test
+  Staging bucket exists: cfn-templates-490004638518
+  Uploading template to s3://cfn-templates-490004638518/gsi-export-test/template.yaml
+  Creating new stack...
 Traceback (most recent call last):
-  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line 288, in <module>
+  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line 297, in <module>
     COMMANDS[sys.argv[1]]()
     ~~~~~~~~~~~~~~~~~~~~~^^
-  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line
- 166, in cmd_deploy
-    cfn, s3 = get_clients()
-              ~~~~~~~~~~~^^
-  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line
- 59, in get_clients
-    cfn = boto3.client("cloudformation", **kwargs)
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\boto3\__init__.py", line 93, in client
-    return _get_default_session().client(*args, **kwargs)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\boto3\session.py", line 337, in client
-    return self._session.create_client(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        service_name, **create_client_kwargs
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\context.py", line 123, in wrapper       
-    return func(*args, **kwargs)
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\session.py", line 1031, in create_client
-    client = client_creator.create_client(
-        service_name=service_name,
-    ...<8 lines>...
-        auth_token=auth_token,
-    )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 157, in create_client  
-    client_args = self._get_client_args(
-        service_model,
-    ...<10 lines>...
-        partition_data,
-    )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 557, in _get_client_args
-    return args_creator.get_client_args(
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        service_model,
-        ^^^^^^^^^^^^^^
-    ...<10 lines>...
-        partition_data,
-        ^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\args.py", line 121, in get_client_args  
-    final_args = self.compute_client_args(
-        service_model,
-    ...<5 lines>...
-        scoped_config,
-    )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\args.py", line 259, in compute_client_args
-    endpoint_config = self._compute_endpoint_config(
-        service_name=service_name,
-    ...<4 lines>...
-        s3_config=s3_config,
-    )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\args.py", line 447, in _compute_endpoint_config
-    return self._resolve_endpoint(**resolve_endpoint_kwargs)
-           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\args.py", line 552, in _resolve_endpoint
-    return endpoint_bridge.resolve(
-           ~~~~~~~~~~~~~~~~~~~~~~~^
-        service_name, region_name, endpoint_url, is_secure
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 671, in resolve        
-    resolved = self.endpoint_resolver.construct_endpoint(
-        service_name,
+  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line 202, in cmd_deploy
+    cfn.create_stack(
+    ~~~~~~~~~~~~~~~~^
+        StackName=STACK_NAME,
+        ^^^^^^^^^^^^^^^^^^^^^
     ...<2 lines>...
-        use_fips_endpoint=use_fips_endpoint,
+        Capabilities=CAPABILITIES,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\regions.py", line 233, in construct_endpoint
-    result = self._endpoint_for_partition(
-        partition,
-    ...<3 lines>...
-        use_fips_endpoint,
-    )
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\regions.py", line 281, in _endpoint_for_partition
-    raise NoRegionError()
-botocore.exceptions.NoRegionError: You must specify a region.
+    ^
+  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 602, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 1078, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (ValidationError) when calling the CreateStack operation: Parameters: [ScheduleExpression] do not exist in the template
