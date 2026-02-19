@@ -2020,10 +2020,13 @@ Resources:
            const days=Object.keys(dayMap).sort();
            if(days.length) charts.daily=new Chart(document.getElementById('c-daily'),{
             type:'bar',data:{labels:days,
-            datasets:[{label:'Contacts',data:days.map(d=>dayMap[d]),
+            datasets:[{label:'Contacts per Day',data:days.map(d=>dayMap[d]),
             backgroundColor:'#4285f4',borderRadius:4}]},
-            options:{responsive:true,plugins:{legend:{display:false}},
-            scales:{x:{ticks:{maxRotation:45}}}}});
+            options:{responsive:true,plugins:{legend:{display:true,position:'top',
+            labels:{color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),
+            font:{size:12,weight:'bold'},padding:12,usePointStyle:true,pointStyle:'rectRounded'}},
+            title:{display:true,text:'Daily Contact Volume',color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),font:{size:14}}},
+            scales:{x:{ticks:{maxRotation:45}},y:{beginAtZero:true}}}});
 
            // by channel chart
            const chanMap={};
@@ -2034,7 +2037,10 @@ Resources:
             type:'doughnut',data:{labels:chans,
             datasets:[{data:chans.map(c=>chanMap[c]),
             backgroundColor:COLORS.slice(0,chans.length)}]},
-            options:{responsive:true}});
+            options:{responsive:true,plugins:{legend:{display:true,position:'bottom',
+            labels:{color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),
+            font:{size:11},padding:10,usePointStyle:true,pointStyle:'circle'}},
+            title:{display:true,text:'Channel Breakdown',color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),font:{size:14}}}}});
 
            // by agent chart
            const agMap={};
@@ -2043,10 +2049,14 @@ Resources:
            const agents=Object.entries(agMap).sort((a,b)=>b[1]-a[1]).slice(0,15);
            if(agents.length) charts.agent=new Chart(document.getElementById('c-agent'),{
             type:'bar',data:{labels:agents.map(a=>a[0]),
-            datasets:[{label:'Contacts',data:agents.map(a=>a[1]),
+            datasets:[{label:'Contacts per Agent',data:agents.map(a=>a[1]),
             backgroundColor:'#34a853',borderRadius:4}]},
             options:{responsive:true,indexAxis:'y',
-            plugins:{legend:{display:false}}}});
+            plugins:{legend:{display:true,position:'top',
+            labels:{color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),
+            font:{size:12,weight:'bold'},padding:12,usePointStyle:true,pointStyle:'rectRounded'}},
+            title:{display:true,text:'Top Agents by Contact Count',color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),font:{size:14}}},
+            scales:{x:{beginAtZero:true}}}});
 
            // by initiation method chart
            const imMap={};
@@ -2057,7 +2067,10 @@ Resources:
             type:'pie',data:{labels:methods,
             datasets:[{data:methods.map(m=>imMap[m]),
             backgroundColor:COLORS.slice(0,methods.length)}]},
-            options:{responsive:true}});
+            options:{responsive:true,plugins:{legend:{display:true,position:'bottom',
+            labels:{color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),
+            font:{size:11},padding:10,usePointStyle:true,pointStyle:'circle'}},
+            title:{display:true,text:'Initiation Method',color:getComputedStyle(document.documentElement).getPropertyValue('--fg'),font:{size:14}}}}});
           }
 
           function renderTable(rows){
