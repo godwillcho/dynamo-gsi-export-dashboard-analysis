@@ -27,7 +27,7 @@ TEMPLATE_FILE = "dynamo-gsi-scheduled-export.yaml"
 REGION = "us-east-1"  # Set explicitly; change to your preferred region
 
 PARAMETERS = {
-    "DynamoTableName":          "ConnectViewDataTest",
+    "DynamoTableName":          "ConnectViewData",
     "GsiName":                  "Channel-InitiationTimestamp-index",
     "GsiPartitionKeyAttribute": "Channel",
     "GsiPartitionKeyValue":     "CHAT",
