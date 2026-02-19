@@ -497,10 +497,11 @@ Resources:
                   return
 
               df = pd.DataFrame(items)
+              df.columns = [c.lower() for c in df.columns]
 
               # Add extra date column derived from GSI sort key
-              if EXTRA_DATE_COL and GSI_SK_ATTR in df.columns:
-                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR].apply(sk_to_date)
+              if EXTRA_DATE_COL and GSI_SK_ATTR.lower() in df.columns:
+                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR.lower()].apply(sk_to_date)
                   logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
 
               logger.info("DataFrame: %d rows, %d cols: %s",
@@ -1010,10 +1011,11 @@ Resources:
                   return
 
               df = pd.DataFrame(items)
+              df.columns = [c.lower() for c in df.columns]
 
               # Add extra date column derived from GSI sort key
-              if EXTRA_DATE_COL and GSI_SK_ATTR in df.columns:
-                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR].apply(sk_to_date)
+              if EXTRA_DATE_COL and GSI_SK_ATTR.lower() in df.columns:
+                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR.lower()].apply(sk_to_date)
                   logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
 
               logger.info("DataFrame created — %d row(s), %d column(s): %s",
