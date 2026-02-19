@@ -1,5 +1,1 @@
-The resource AthenaSetup is in a CREATE_FAILED state
-This Custom::AthenaSetup resource is in a CREATE_FAILED state.
-
-Received response status [FAILED] from custom resource. Message returned: DDL FAILED: FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. MetaException(message:User: arn:aws:sts::490004638518:assumed-role/gsi-export-athena-setup-role/gsi-export-athena-setup is not authorized to perform: glue:CreateDatabase on resource: arn:aws:glue:us-east-1:490004638518:database/gsi_export_db because no identity-based policy allows the glue:CreateDatabase action (Service: AmazonDataCatalog; Status Code: 400; Error Code: AccessDeniedException; Request ID: f7942f6c-84cb-48a8-b981-8c7b8af69c47; Proxy: null)) (RequestId: 72013735-2c6c-4fdc-80ef-c3e80a28804e)
-
+{"Message":"Forbidden. For troubleshooting Function URL authorization issues, see: https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html"}
