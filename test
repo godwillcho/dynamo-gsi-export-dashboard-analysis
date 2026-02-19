@@ -1,28 +1,4 @@
-$ python deploy.py deploy
+The resource AthenaSetup is in a CREATE_FAILED state
+This Custom::AthenaSetup resource is in a CREATE_FAILED state.
 
-Deploying stack: gsi-export-test
-  Staging bucket exists: cfn-templates-490004638518
-  Uploading template to s3://cfn-templates-490004638518/gsi-export-test/template.yaml
-  Creating new stack...
-Traceback (most recent call last):
-  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line 297, in <module>
-    COMMANDS[sys.argv[1]]()
-    ~~~~~~~~~~~~~~~~~~~~~^^
-  File "C:\Users\godwill.cho\OneDrive - SoftwareOne\Desktop\CLH_DYNAMODB_S3_ATHENA\dynamo-gsi-export-dashboard-analysis\deploy.py", line 202, in cmd_deploy
-    cfn.create_stack(
-    ~~~~~~~~~~~~~~~~^
-        StackName=STACK_NAME,
-        ^^^^^^^^^^^^^^^^^^^^^
-    ...<2 lines>...
-        Capabilities=CAPABILITIES,
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 602, in _api_call
-    return self._make_api_call(operation_name, kwargs)
-           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\context.py", line 123, in wrapper
-    return func(*args, **kwargs)
-  File "C:\Users\godwill.cho\AppData\Local\Programs\Python\Python313\Lib\site-packages\botocore\client.py", line 1078, in _make_api_call
-    raise error_class(parsed_response, operation_name)
-botocore.exceptions.ClientError: An error occurred (ValidationError) when calling the CreateStack operation: Parameters: [ScheduleExpression] do not exist in the template
+Received response status [FAILED] from custom resource. Message returned: An error occurred (InvalidRequestException) when calling the StartQueryExecution operation: line 1:8: mismatched input 'DATABASE'. Expecting: 'MATERIALIZED', 'MULTI', 'OR', 'PROTECTED', 'ROLE', 'SCHEMA', 'TABLE', 'VIEW' (RequestId: 85cbb9d2-be45-40c8-bb15-81c730b9f873)
