@@ -293,6 +293,48 @@ The on-demand Lambda uses the same date range configuration as the scheduled exp
 
 ---
 
+## Querying Data via Athena CLI
+
+Run a query against the exported data directly from the command line:
+
+```bash
+aws athena start-query-execution \
+  --query-string "SELECT * FROM <AthenaDatabase>.gsi_export LIMIT 100" \
+  --work-group <AthenaWorkgroup> \
+  --region us-east-1 \
+  --output json
+```
+
+Then retrieve the results using the `QueryExecutionId` returned:
+
+```bash
+aws athena get-query-results \
+  --query-execution-id <QueryExecutionId> \
+  --region us-east-1
+```
+
+Example queries:
+
+```sql
+-- All records
+SELECT * FROM gsi_dynamodb_athena_db.gsi_export LIMIT 100;
+
+-- Filter by date range
+SELECT * FROM gsi_dynamodb_athena_db.gsi_export
+WHERE report_date BETWEEN '2026-01-01' AND '2026-02-19';
+
+-- Daily summary
+SELECT report_date, COUNT(*) as contacts
+FROM gsi_dynamodb_athena_db.gsi_export
+GROUP BY report_date ORDER BY report_date DESC;
+
+-- Filter by partition (most cost-efficient)
+SELECT * FROM gsi_dynamodb_athena_db.gsi_export
+WHERE year=2026 AND month=2 AND day=19;
+```
+
+---
+
 ## How the Export Works
 
 1. **Query** — Lambda queries the DynamoDB GSI using the configured partition key value and a date range on the sort key
