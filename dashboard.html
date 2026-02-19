@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contact Center Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f0f2f5;color:#333;padding:20px}
+header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:#fff;
+padding:20px 30px;border-radius:10px;margin-bottom:20px;
+display:flex;justify-content:space-between;align-items:center}
+h1{font-size:1.4em}
+#load-banner{background:#ffc107;color:#333;padding:6px 14px;
+border-radius:20px;font-size:.82em;font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+gap:14px;margin-bottom:22px}
+.card{background:#fff;border-radius:10px;padding:18px;
+box-shadow:0 2px 6px rgba(0,0,0,.08);text-align:center}
+.card h3{font-size:.78em;color:#888;text-transform:uppercase;
+letter-spacing:.5px;margin-bottom:6px}
+.card .val{font-size:2.2em;font-weight:700;color:#1a73e8}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));
+gap:14px;margin-bottom:22px}
+.chart-box{background:#fff;border-radius:10px;padding:18px;
+box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.chart-box h3{font-size:.9em;color:#555;margin-bottom:10px}
+section{margin-bottom:22px}
+table{width:100%;border-collapse:collapse;font-size:.85em}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #eee}
+th{background:#f8f9fa;font-weight:600;position:sticky;top:0;z-index:1}
+tr:hover{background:#f0f4ff}
+.panel{background:#fff;border-radius:10px;padding:22px;
+box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.qform{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:14px 0}
+.qform label{display:flex;flex-direction:column;font-size:.82em;color:#555}
+.qform input,.qform select,.qform textarea{padding:8px;
+border:1px solid #ddd;border-radius:6px;margin-top:3px;font-size:.95em}
+.qform textarea{min-width:300px}
+.btn{border:none;padding:10px 22px;border-radius:6px;cursor:pointer;
+font-weight:600;font-size:.9em;color:#fff}
+.btn-blue{background:#1a73e8}.btn-blue:hover{background:#1557b0}
+.btn-green{background:#34a853}.btn-green:hover{background:#2d8e47}
+.status{padding:10px 14px;border-radius:6px;margin:10px 0;font-size:.9em}
+.status-load{background:#fff3cd;color:#856404}
+.status-ok{background:#d4edda;color:#155724}
+.status-err{background:#f8d7da;color:#721c24}
+.tbl-scroll{max-height:400px;overflow:auto;margin-top:10px;
+border:1px solid #eee;border-radius:6px}
+.hide{display:none!important}
+.results-hdr{display:flex;justify-content:space-between;
+align-items:center;margin-top:10px}
+</style></head><body>
+<header>
+<h1>Contact Center Dashboard</h1>
+<div style="display:flex;align-items:center;gap:10px">
+<div id="load-banner">Loading statistics...</div>
+<button class="btn" id="refresh-btn" style="background:#fff;color:#1a73e8;
+padding:8px 16px;font-size:.82em" onclick="refreshStats()">Refresh</button>
+</div>
+</header>
+
+<div class="cards">
+<div class="card"><h3>Total Contacts</h3><div class="val" id="s-total">--</div></div>
+<div class="card"><h3>Today</h3><div class="val" id="s-today">--</div></div>
+<div class="card"><h3>Channels</h3><div class="val" id="s-chan">--</div></div>
+<div class="card"><h3>Active Agents</h3><div class="val" id="s-agents">--</div></div>
+</div>
+
+<div class="charts">
+<div class="chart-box"><div style="display:flex;justify-content:space-between;
+align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+<h3 style="margin:0">Contacts Per Day</h3>
+<div style="display:flex;gap:6px;align-items:center;font-size:.82em">
+<label>From <input type="date" id="chart-from" style="padding:4px;
+border:1px solid #ddd;border-radius:4px"></label>
+<label>To <input type="date" id="chart-to" style="padding:4px;
+border:1px solid #ddd;border-radius:4px"></label>
+<button class="btn btn-blue" style="padding:6px 12px;font-size:.82em"
+onclick="updateDailyChart()">Apply</button>
+<button class="btn" style="padding:6px 12px;font-size:.82em;
+background:#6c757d;color:#fff" onclick="resetDailyChart()">Reset</button>
+</div></div>
+<canvas id="c-daily"></canvas></div>
+<div class="chart-box"><h3>By Original Channel</h3>
+<canvas id="c-chan"></canvas></div>
+<div class="chart-box"><h3>Top Agents</h3>
+<canvas id="c-agent"></canvas></div>
+<div class="chart-box"><h3>Initiation Method</h3>
+<canvas id="c-init"></canvas></div>
+</div>
+
+<section class="panel">
+<h3>Recent Contacts</h3>
+<div class="tbl-scroll" style="max-height:260px">
+<table><thead><tr><th>Contact ID</th><th>Agent</th><th>Channel</th>
+<th>Method</th><th>Timestamp</th><th>Date</th></tr></thead>
+<tbody id="recent-tb"></tbody></table></div>
+</section>
+
+<section class="panel">
+<h2 style="margin-bottom:4px">Run Query</h2>
+<div class="qform">
+<label>Query Type<select id="qt">
+<option value="all_records">All Records</option>
+<option value="by_date">By Date Range</option>
+<option value="by_agent">By Agent</option>
+<option value="by_contact">By Contact ID</option>
+<option value="daily_summary">Daily Summary (by Agent)</option>
+<option value="channel_summary">Daily Summary (by Channel)</option>
+<option value="custom_sql">Custom SQL</option>
+</select></label>
+<div id="p-by_date" class="hide">
+<label>Start<input type="date" id="f-sd"></label></div>
+<div id="p-by_date2" class="hide">
+<label>End<input type="date" id="f-ed"></label></div>
+<div id="p-by_agent" class="hide">
+<label>Agent Name<select id="f-agent"><option value="">-- Select Agent --</option></select></label></div>
+<div id="p-by_contact" class="hide">
+<label>Contact ID<input type="text" id="f-cid" placeholder="ID"></label></div>
+<div id="p-custom_sql" class="hide">
+<label>SQL<textarea id="f-sql" rows="2" placeholder="SELECT ..."></textarea></label></div>
+<label>Limit<input type="number" id="f-limit" value="100" min="1" max="10000" style="width:80px"></label>
+<button class="btn btn-blue" id="run-btn">Run Query</button>
+</div>
+<div id="q-status" class="hide status"></div>
+<div id="q-results" class="hide">
+<div class="results-hdr">
+<span id="q-count"></span>
+<button class="btn btn-green hide" id="dl-btn">Download CSV</button>
+</div>
+<div class="tbl-scroll"><table>
+<thead id="r-thead"></thead><tbody id="r-tbody"></tbody>
+</table></div></div>
+</section>
+
+<script>
+const COLORS=['#4285f4','#ea4335','#fbbc04','#34a853',
+'#ff6d01','#46bdc6','#9c27b0','#795548'];
+let charts={};
+let allDailyData=[];
+document.addEventListener('DOMContentLoaded',()=>{loadStats();setupForm()});
+
+function refreshStats(){loadStats(true)}
+
+async function loadStats(force){
+ const b=document.getElementById('load-banner');
+ b.style.display='inline-block';b.style.background='#ffc107';
+ b.style.color='#333';
+ b.textContent=force?'Refreshing statistics...':'Loading statistics...';
+ document.getElementById('refresh-btn').disabled=true;
+ Object.values(charts).forEach(c=>c.destroy());charts={};
+ try{
+  const url=force?'/api/stats?refresh=1':'/api/stats';
+  const r=await fetch(url);const d=await r.json();
+  document.getElementById('s-total').textContent=
+   Number(d.totalContacts||0).toLocaleString();
+  document.getElementById('s-today').textContent=
+   Number(d.todayContacts||0).toLocaleString();
+  document.getElementById('s-chan').textContent=
+   (d.contactsByChannel||[]).length;
+  document.getElementById('s-agents').textContent=
+   (d.contactsByAgent||[]).length;
+  allDailyData=(d.contactsByDay||[]).reverse();
+  renderDailyChart(allDailyData);
+  const ch=d.contactsByChannel||[];
+  if(ch.length) charts.chan=new Chart(document.getElementById('c-chan'),{
+   type:'doughnut',data:{labels:ch.map(r=>r.originalcontactchannel),
+   datasets:[{data:ch.map(r=>+r.cnt),
+   backgroundColor:COLORS.slice(0,ch.length)}]},
+   options:{responsive:true}});
+  const ag=(d.contactsByAgent||[]).slice(0,10);
+  if(ag.length) charts.agent=new Chart(document.getElementById('c-agent'),{
+   type:'bar',data:{labels:ag.map(r=>r.agentname),
+   datasets:[{label:'Contacts',data:ag.map(r=>+r.cnt),
+   backgroundColor:'#34a853',borderRadius:4}]},
+   options:{responsive:true,indexAxis:'y',
+   plugins:{legend:{display:false}}}});
+  const im=d.contactsByInitiation||[];
+  if(im.length) charts.init=new Chart(document.getElementById('c-init'),{
+   type:'pie',data:{labels:im.map(r=>r.initiationmethod),
+   datasets:[{data:im.map(r=>+r.cnt),
+   backgroundColor:COLORS.slice(0,im.length)}]},
+   options:{responsive:true}});
+  const rc=d.recentContacts||[];
+  document.getElementById('recent-tb').innerHTML=rc.map(r=>
+   `<tr><td>${r.contactid||''}</td><td>${r.agentname||''}</td>
+   <td>${r.channel||''}</td><td>${r.initiationmethod||''}</td>
+   <td>${r.initiationtimestamp||''}</td>
+   <td>${r.report_date||''}</td></tr>`).join('');
+  const agSel=document.getElementById('f-agent');
+  const cur=agSel.value;
+  agSel.innerHTML='<option value="">-- Select Agent --</option>'+
+   (d.contactsByAgent||[]).map(a=>
+    `<option value="${a.agentname}">${a.agentname} (${a.cnt})</option>`).join('');
+  if(cur) agSel.value=cur;
+  b.style.display='none';
+  document.getElementById('refresh-btn').disabled=false;
+ }catch(e){b.textContent='Error: '+e.message;
+  b.style.background='#dc3545';b.style.color='#fff';
+  document.getElementById('refresh-btn').disabled=false;}
+}
+
+function setupForm(){
+ const sel=document.getElementById('qt');
+ const groups=['p-by_date','p-by_date2','p-by_agent',
+  'p-by_contact','p-custom_sql'];
+ sel.addEventListener('change',()=>{
+  groups.forEach(g=>document.getElementById(g).classList.add('hide'));
+  const v=sel.value;
+  if(v==='by_date'||v==='daily_summary'||v==='channel_summary'){
+   document.getElementById('p-by_date').classList.remove('hide');
+   document.getElementById('p-by_date2').classList.remove('hide');}
+  if(v==='by_agent')
+   document.getElementById('p-by_agent').classList.remove('hide');
+  if(v==='by_contact')
+   document.getElementById('p-by_contact').classList.remove('hide');
+  if(v==='custom_sql')
+   document.getElementById('p-custom_sql').classList.remove('hide');
+ });
+ document.getElementById('run-btn').addEventListener('click',runQuery);
+}
+
+let lastQid=null;
+async function runQuery(){
+ const st=document.getElementById('q-status');
+ const res=document.getElementById('q-results');
+ st.className='status status-load';st.textContent='Running query...';
+ st.classList.remove('hide');res.classList.add('hide');
+ const body={query:document.getElementById('qt').value,
+  limit:+document.getElementById('f-limit').value};
+ if(body.query==='by_date'||body.query==='daily_summary'
+  ||body.query==='channel_summary'){
+  body.startDate=document.getElementById('f-sd').value;
+  body.endDate=document.getElementById('f-ed').value;}
+ if(body.query==='by_agent')
+  body.agentName=document.getElementById('f-agent').value;
+ else if(body.query==='by_contact')
+  body.contactId=document.getElementById('f-cid').value;
+ else if(body.query==='custom_sql')
+  body.sql=document.getElementById('f-sql').value;
+ try{
+  const r=await fetch('/api/query',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify(body)});
+  const d=await r.json();
+  if(d.error){st.className='status status-err';
+   st.textContent='Error: '+d.error;return;}
+  lastQid=d.queryExecutionId;
+  const mb=(d.dataScannedBytes/1048576).toFixed(2);
+  st.className='status status-ok';
+  st.textContent=`Done. Scanned: ${mb} MB | Runtime: ${d.runtimeMs} ms`;
+  const rr=await fetch('/api/results?queryExecutionId='+lastQid);
+  const rows=await rr.json();
+  renderTable(rows);
+  const dl=document.getElementById('dl-btn');
+  dl.classList.remove('hide');
+  dl.onclick=()=>window.open('/api/download?queryExecutionId='+lastQid);
+ }catch(e){st.className='status status-err';
+  st.textContent='Failed: '+e.message;}
+}
+
+function renderDailyChart(data){
+ if(charts.daily) charts.daily.destroy();
+ if(!data.length) return;
+ charts.daily=new Chart(document.getElementById('c-daily'),{
+  type:'bar',data:{labels:data.map(r=>r.report_date),
+  datasets:[{label:'Contacts',data:data.map(r=>+r.cnt),
+  backgroundColor:'#4285f4',borderRadius:4}]},
+  options:{responsive:true,plugins:{legend:{display:false}},
+  scales:{x:{ticks:{maxRotation:45}}}}});
+}
+
+async function updateDailyChart(){
+ const from=document.getElementById('chart-from').value;
+ const to=document.getElementById('chart-to').value;
+ if(!from||!to){alert('Please select both From and To dates');return;}
+ try{
+  const r=await fetch('/api/daily?from='+from+'&to='+to);
+  const rows=await r.json();
+  if(rows.error){alert(rows.error);return;}
+  renderDailyChart(rows);
+ }catch(e){alert('Error: '+e.message)}
+}
+
+function resetDailyChart(){
+ document.getElementById('chart-from').value='';
+ document.getElementById('chart-to').value='';
+ renderDailyChart(allDailyData);
+}
+
+function renderTable(rows){
+ const res=document.getElementById('q-results');
+ const th=document.getElementById('r-thead');
+ const tb=document.getElementById('r-tbody');
+ if(!rows||!rows.length){
+  res.classList.remove('hide');
+  document.getElementById('q-count').textContent='No results';
+  th.innerHTML='';tb.innerHTML='';return;}
+ const cols=Object.keys(rows[0]);
+ document.getElementById('q-count').textContent=rows.length+' rows';
+ th.innerHTML='<tr>'+cols.map(c=>'<th>'+c+'</th>').join('')+'</tr>';
+ tb.innerHTML=rows.map(r=>'<tr>'+cols.map(c=>
+  '<td>'+(r[c]||'')+'</td>').join('')+'</tr>').join('');
+ res.classList.remove('hide');
+}
+</script></body></html>

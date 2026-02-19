@@ -1,0 +1,7 @@
+# Local artifacts
+.claude/
+out.json
+response.json
+test.py
+__pycache__/
+*.pyc

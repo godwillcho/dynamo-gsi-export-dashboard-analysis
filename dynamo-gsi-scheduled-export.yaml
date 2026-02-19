@@ -1,0 +1,2199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Optionally creates a DynamoDB table with a GSI, or uses an existing table.
+  A scheduled Lambda queries the GSI by a single partition key value and a
+  date range on the sort key, writes the results as Parquet to S3,
+  queryable by Athena via partition projection. No Glue required.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  # --- DynamoDB ---
+  CreateTable:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Set to 'true' to create a new DynamoDB table with the GSI.
+      Set to 'false' to use an existing table (GSI must already exist).
+
+  DynamoTableName:
+    Type: String
+    Description: >
+      Name of the DynamoDB table. Used as the table name when creating a new
+      table, or to reference an existing table.
+
+  TablePKName:
+    Type: String
+    Default: pk
+    Description: >
+      Attribute name for the table partition key.
+      Only used when CreateTable is 'true'.
+
+  TablePKType:
+    Type: String
+    Default: S
+    AllowedValues: [S, N, B]
+    Description: >
+      Attribute type for the table partition key (S=String, N=Number, B=Binary).
+      Only used when CreateTable is 'true'.
+
+  TableSKName:
+    Type: String
+    Default: ''
+    Description: >
+      Attribute name for the table sort key. Leave blank for a PK-only table.
+      Only used when CreateTable is 'true'.
+
+  TableSKType:
+    Type: String
+    Default: S
+    AllowedValues: [S, N, B]
+    Description: >
+      Attribute type for the table sort key (S=String, N=Number, B=Binary).
+      Only used when CreateTable is 'true' and TableSKName is not blank.
+
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    Description: >
+      DynamoDB billing mode. Only used when CreateTable is 'true'.
+      If PROVISIONED, you must configure capacity separately after deployment.
+
+  GsiName:
+    Type: String
+    Description: Name of the GSI to query (e.g. status-date-index).
+
+  GsiPartitionKeyAttribute:
+    Type: String
+    Description: Attribute name of the GSI partition key (e.g. status).
+
+  GsiPartitionKeyValue:
+    Type: String
+    Description: >
+      The single value to query the GSI partition key with (e.g. ACTIVE).
+
+  GsiSortKeyAttribute:
+    Type: String
+    Description: >
+      Attribute name of the GSI sort key that holds the date
+      (e.g. created_at).
+
+  DateFormat:
+    Type: String
+    Default: ISO
+    AllowedValues:
+      - ISO              # e.g. 2024-01-31T00:00:00Z  or  2024-01-31
+      - EPOCH            # integer / decimal seconds since Unix epoch
+      - HUMAN_READABLE   # e.g. February 16, 2026 09:58:00 AM EST
+    Description: >
+      Format of the date value stored in the sort key attribute.
+      NOTE: HUMAN_READABLE dates do not sort lexicographically, so the
+      scheduled export's date-range queries may return incorrect results.
+      Use the on-demand export with {} (all data) for reliable results.
+
+  ExtraDateColumn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. If set (e.g. 'report_date'), the Lambda adds a column with
+      this name to each Parquet row containing the YYYY-MM-DD date derived
+      from the GSI sort key. Makes Athena date filtering easy. Leave blank
+      to skip.
+
+  # --- Schedule ---
+  CronExpression:
+    Type: String
+    Default: 'cron(0 1 * * ? *)'
+    Description: >
+      EventBridge cron for when the Lambda runs.
+      Default: 01:00 UTC every day.
+
+  DateRangeMode:
+    Type: String
+    Default: PREVIOUS_DAY
+    AllowedValues:
+      - PREVIOUS_DAY
+      - PREVIOUS_WEEK
+      - LAST_N_HOURS
+    Description: >
+      Controls the date window the Lambda queries.
+      PREVIOUS_DAY  -> yesterday 00:00:00 to 23:59:59 UTC
+      PREVIOUS_WEEK -> Mon-Sun of the previous ISO week
+      LAST_N_HOURS  -> now minus N hours to now (set N via LookbackHours)
+
+  LookbackHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 8760
+    Description: >
+      Only used when DateRangeMode is LAST_N_HOURS.
+      Number of hours to look back from the time of invocation.
+
+  # --- S3 ---
+  S3BucketName:
+    Type: String
+    Description: Globally unique name for the S3 bucket storing exported Parquet files.
+
+  S3DataPrefix:
+    Type: String
+    Default: dynamo-gsi-export
+    Description: >
+      S3 key prefix WITHOUT trailing slash. Files will be written under:
+      s3://<bucket>/<prefix>/year=YYYY/month=MM/day=DD/<file>.parquet
+
+  OverwriteMode:
+    Type: String
+    Default: OVERWRITE
+    AllowedValues:
+      - OVERWRITE       # idempotent; same key each run for a given date range
+      - APPEND          # timestamped file; multiple files per date partition
+    Description: >
+      OVERWRITE: each run for the same date range replaces the previous file.
+      APPEND: each run writes a new timestamped file alongside existing ones.
+
+  # --- Athena ---
+  ProjectionYearRange:
+    Type: String
+    Default: '2024,2030'
+    Description: >
+      Comma-separated start,end year for Athena partition projection
+      (e.g. 2024,2030).
+
+  # --- Misc ---
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+
+  ShouldCreateTable:
+    !Equals [!Ref CreateTable, 'true']
+
+  HasTableSortKey:
+    !Not [!Equals [!Ref TableSKName, '']]
+
+  CreateTableWithSK:
+    !And
+      - !Condition ShouldCreateTable
+      - !Condition HasTableSortKey
+
+  CreateTableWithoutSK:
+    !And
+      - !Condition ShouldCreateTable
+      - !Not [!Condition HasTableSortKey]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # 0. DynamoDB Table (conditional — only created when CreateTable = true)
+  #
+  #    Two resource variants handle the optional table sort key because
+  #    CloudFormation does not support conditional list elements.
+  # -------------------------------------------------------------------------
+  DynamoTableWithSK:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateTableWithSK
+    Properties:
+      TableName: !Ref DynamoTableName
+      BillingMode: !Ref BillingMode
+      KeySchema:
+        - AttributeName: !Ref TablePKName
+          KeyType: HASH
+        - AttributeName: !Ref TableSKName
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: !Ref TablePKName
+          AttributeType: !Ref TablePKType
+        - AttributeName: !Ref TableSKName
+          AttributeType: !Ref TableSKType
+        - AttributeName: !Ref GsiPartitionKeyAttribute
+          AttributeType: S
+        - AttributeName: !Ref GsiSortKeyAttribute
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: !Ref GsiName
+          KeySchema:
+            - AttributeName: !Ref GsiPartitionKeyAttribute
+              KeyType: HASH
+            - AttributeName: !Ref GsiSortKeyAttribute
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  DynamoTableWithoutSK:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateTableWithoutSK
+    Properties:
+      TableName: !Ref DynamoTableName
+      BillingMode: !Ref BillingMode
+      KeySchema:
+        - AttributeName: !Ref TablePKName
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: !Ref TablePKName
+          AttributeType: !Ref TablePKType
+        - AttributeName: !Ref GsiPartitionKeyAttribute
+          AttributeType: S
+        - AttributeName: !Ref GsiSortKeyAttribute
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: !Ref GsiName
+          KeySchema:
+            - AttributeName: !Ref GsiPartitionKeyAttribute
+              KeyType: HASH
+            - AttributeName: !Ref GsiSortKeyAttribute
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # -------------------------------------------------------------------------
+  # 0b. On-demand export to S3 (Parquet) — same format as scheduled export
+  #
+  #     User-triggered. Invoke manually to export GSI data to S3 as Parquet,
+  #     in the same Hive-partitioned layout queryable by Athena.
+  #
+  #     Usage (all data):
+  #       aws lambda invoke --function-name <stack>-on-demand-export \
+  #         --payload '{}' out.json
+  #
+  #     Usage (custom date range):
+  #       aws lambda invoke --function-name <stack>-on-demand-export \
+  #         --payload '{"startDate":"2024-06-01","endDate":"2024-06-30"}' out.json
+  # -------------------------------------------------------------------------
+  OnDemandExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-on-demand-export-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoQueryAndS3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDBQuery
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}/index/${GsiName}'
+              - Sid: S3Write
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  OnDemandExportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-on-demand-export'
+      RetentionInDays: !Ref LogRetentionDays
+
+  OnDemandExportFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OnDemandExportLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-on-demand-export'
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt OnDemandExportRole.Arn
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python312:16'
+      Environment:
+        Variables:
+          DYNAMO_TABLE_NAME: !Ref DynamoTableName
+          GSI_NAME:          !Ref GsiName
+          GSI_PK_ATTRIBUTE:  !Ref GsiPartitionKeyAttribute
+          GSI_PK_VALUE:      !Ref GsiPartitionKeyValue
+          GSI_SK_ATTRIBUTE:  !Ref GsiSortKeyAttribute
+          DATE_FORMAT:       !Ref DateFormat
+          S3_BUCKET:         !Ref S3BucketName
+          S3_PREFIX:         !Ref S3DataPrefix
+          EXTRA_DATE_COLUMN: !Ref ExtraDateColumn
+          LOG_LEVEL:         'INFO'
+      Code:
+        ZipFile: |
+          """
+          On-demand GSI export to S3. Same Parquet/Hive format as the
+          scheduled export so Athena queries both seamlessly.
+          Pass {"startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD"} to export
+          a specific range, or {} to export all data for the GSI PK value.
+          """
+          import os
+          import logging
+          import uuid
+          from datetime import datetime, date, timedelta, timezone
+
+          import boto3
+          import awswrangler as wr
+          import pandas as pd
+          from boto3.dynamodb.conditions import Key
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          # ── timezone abbreviation map ───────────────────────────────────
+          TZ_MAP = {
+              'EST': timezone(timedelta(hours=-5)),
+              'EDT': timezone(timedelta(hours=-4)),
+              'CST': timezone(timedelta(hours=-6)),
+              'CDT': timezone(timedelta(hours=-5)),
+              'MST': timezone(timedelta(hours=-7)),
+              'MDT': timezone(timedelta(hours=-6)),
+              'PST': timezone(timedelta(hours=-8)),
+              'PDT': timezone(timedelta(hours=-7)),
+              'UTC': timezone.utc,
+              'GMT': timezone.utc,
+          }
+          HUMAN_FMT = '%B %d, %Y %I:%M:%S %p'
+
+          def parse_human_date(s: str) -> datetime:
+              """Parse 'February 16, 2026 09:58:00 AM EST' into a tz-aware datetime."""
+              parts = s.rsplit(' ', 1)
+              if len(parts) == 2 and parts[1] in TZ_MAP:
+                  dt = datetime.strptime(parts[0], HUMAN_FMT)
+                  return dt.replace(tzinfo=TZ_MAP[parts[1]])
+              dt = datetime.strptime(s, HUMAN_FMT)
+              return dt.replace(tzinfo=timezone.utc)
+
+          TABLE_NAME       = os.environ['DYNAMO_TABLE_NAME']
+          GSI_NAME         = os.environ['GSI_NAME']
+          GSI_PK_ATTR      = os.environ['GSI_PK_ATTRIBUTE']
+          GSI_PK_VALUE     = os.environ['GSI_PK_VALUE']
+          GSI_SK_ATTR      = os.environ['GSI_SK_ATTRIBUTE']
+          DATE_FORMAT      = os.environ['DATE_FORMAT']
+          S3_BUCKET        = os.environ['S3_BUCKET']
+          S3_PREFIX        = os.environ['S3_PREFIX']
+          EXTRA_DATE_COL   = os.environ.get('EXTRA_DATE_COLUMN', '')
+
+          dynamodb = boto3.resource('dynamodb')
+          table    = dynamodb.Table(TABLE_NAME)
+
+
+          def to_sk_value(dt: datetime) -> str | float:
+              if DATE_FORMAT == 'EPOCH':
+                  return dt.timestamp()
+              if DATE_FORMAT == 'HUMAN_READABLE':
+                  est = TZ_MAP.get('EST', timezone(timedelta(hours=-5)))
+                  local_dt = dt.astimezone(est)
+                  return local_dt.strftime(HUMAN_FMT) + ' EST'
+              # ISO with microseconds and explicit offset to match
+              # formats like 2026-02-16T14:56:40.288000+00:00
+              return dt.strftime('%Y-%m-%dT%H:%M:%S.%f') + '+00:00'
+
+
+          def query_gsi(start_val=None, end_val=None) -> list[dict]:
+              """Query GSI. If start/end provided, filter by SK range."""
+              if start_val is not None and end_val is not None:
+                  key_cond = (
+                      Key(GSI_PK_ATTR).eq(GSI_PK_VALUE) &
+                      Key(GSI_SK_ATTR).between(start_val, end_val)
+                  )
+              else:
+                  key_cond = Key(GSI_PK_ATTR).eq(GSI_PK_VALUE)
+
+              kwargs = {
+                  'IndexName': GSI_NAME,
+                  'KeyConditionExpression': key_cond,
+              }
+
+              items = []
+              page = 0
+              while True:
+                  resp = table.query(**kwargs)
+                  page_items = resp.get('Items', [])
+                  items.extend(page_items)
+                  page += 1
+                  logger.debug("Page %d: %d items, total=%d",
+                               page, len(page_items), len(items))
+                  last = resp.get('LastEvaluatedKey')
+                  if not last:
+                      break
+                  kwargs['ExclusiveStartKey'] = last
+
+              logger.info("Query complete — %d item(s) across %d page(s)",
+                          len(items), page)
+              return items
+
+
+          def sk_to_date(sk_val) -> str | None:
+              """Extract YYYY-MM-DD from a sort-key value."""
+              try:
+                  if DATE_FORMAT == 'EPOCH':
+                      dt = datetime.fromtimestamp(float(sk_val), tz=timezone.utc)
+                  elif DATE_FORMAT == 'HUMAN_READABLE':
+                      dt = parse_human_date(str(sk_val))
+                  else:
+                      dt = datetime.fromisoformat(str(sk_val).replace('Z', '+00:00'))
+                  return dt.strftime('%Y-%m-%d')
+              except Exception:
+                  return None
+
+
+          def write_parquet(items: list[dict], s3_key: str) -> None:
+              if not items:
+                  logger.warning("No items — skipping S3 upload.")
+                  return
+
+              df = pd.DataFrame(items)
+
+              # Add extra date column derived from GSI sort key
+              if EXTRA_DATE_COL and GSI_SK_ATTR in df.columns:
+                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR].apply(sk_to_date)
+                  logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
+
+              logger.info("DataFrame: %d rows, %d cols: %s",
+                          len(df), len(df.columns), list(df.columns))
+
+              for col in df.columns:
+                  if df[col].dtype == object:
+                      try:
+                          df[col] = df[col].apply(
+                              lambda x: float(x) if hasattr(x, 'as_tuple') else x
+                          )
+                      except Exception:
+                          logger.debug("Could not cast column '%s'", col)
+
+              s3_path = f"s3://{S3_BUCKET}/{s3_key}"
+              wr.s3.to_parquet(df=df, path=s3_path, index=False, compression='snappy')
+              logger.info("Wrote %d row(s) to %s", len(df), s3_path)
+
+
+          def handler(event, context):
+              request_id = getattr(context, 'aws_request_id', 'local')
+              logger.info("On-demand export — request_id=%s table=%s gsi=%s",
+                          request_id, TABLE_NAME, GSI_NAME)
+
+              start_str = event.get('startDate')
+              end_str   = event.get('endDate')
+
+              start_val = None
+              end_val   = None
+              if start_str and end_str:
+                  start_dt = datetime.fromisoformat(start_str).replace(tzinfo=timezone.utc)
+                  end_dt   = datetime.fromisoformat(end_str).replace(
+                      hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                  start_val = to_sk_value(start_dt)
+                  end_val   = to_sk_value(end_dt)
+                  logger.info("Date range: %s -> %s", start_val, end_val)
+              else:
+                  logger.info("No date range — exporting ALL data for PK=%s",
+                              GSI_PK_VALUE)
+
+              items = query_gsi(start_val, end_val)
+
+              if not items:
+                  logger.warning("No items found.")
+                  return {'statusCode': 200, 'itemCount': 0, 's3Keys': []}
+
+              # Group items by date and write one Parquet file per day partition
+              s3_keys = []
+              items_by_date = {}
+              for item in items:
+                  sk_val = item.get(GSI_SK_ATTR, '')
+                  try:
+                      if DATE_FORMAT == 'EPOCH':
+                          dt = datetime.fromtimestamp(float(sk_val), tz=timezone.utc)
+                      elif DATE_FORMAT == 'HUMAN_READABLE':
+                          dt = parse_human_date(str(sk_val))
+                      else:
+                          dt = datetime.fromisoformat(str(sk_val).replace('Z', '+00:00'))
+                      day_key = dt.date()
+                  except Exception:
+                      day_key = date.today()
+                  items_by_date.setdefault(day_key, []).append(item)
+
+              logger.info("Items span %d day partition(s)", len(items_by_date))
+
+              for day, day_items in sorted(items_by_date.items()):
+                  ts = datetime.now(timezone.utc).strftime('%H%M%S')
+                  filename = f"ondemand-{ts}-{uuid.uuid4().hex[:8]}.parquet"
+                  s3_key = (f"{S3_PREFIX}/year={day.year}"
+                            f"/month={day.month:02d}/day={day.day:02d}/{filename}")
+                  write_parquet(day_items, s3_key)
+                  s3_keys.append(s3_key)
+
+              logger.info("Export complete — %d item(s), %d file(s)",
+                          len(items), len(s3_keys))
+
+              return {
+                  'statusCode': 200,
+                  'itemCount': len(items),
+                  's3Keys': s3_keys,
+              }
+
+  # -------------------------------------------------------------------------
+  # 1. S3 Buckets
+  # -------------------------------------------------------------------------
+  ExportDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  ExportDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExportDataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyNonHttps
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3BucketName}'
+              - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketName}-athena-results'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # -------------------------------------------------------------------------
+  # 2. IAM Role for Lambda
+  # -------------------------------------------------------------------------
+  ExportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-export-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDBQuery
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoTableName}/index/${GsiName}'
+              - Sid: S3Write
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  # -------------------------------------------------------------------------
+  # 3. CloudWatch Log Group
+  # -------------------------------------------------------------------------
+  ExportLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-gsi-exporter'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # -------------------------------------------------------------------------
+  # 4. Lambda Function
+  #
+  #    Uses the AWS SDK for pandas (awswrangler) public Lambda Layer which
+  #    bundles pyarrow and pandas — no custom layer build needed.
+  #    Layer ARN list: https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+  #    The ARN below is for us-east-1 / Python 3.12. Update for your region.
+  # -------------------------------------------------------------------------
+  ExportLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ExportLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-gsi-exporter'
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 900        # 15 minutes — allow for large result sets
+      MemorySize: 1024    # pyarrow benefits from headroom
+      Role: !GetAtt ExportLambdaRole.Arn
+      # AWS SDK for pandas managed layer (pyarrow + pandas included).
+      # Find the correct ARN for your region at:
+      # https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python312:16'
+      Environment:
+        Variables:
+          DYNAMO_TABLE_NAME:       !Ref DynamoTableName
+          GSI_NAME:                !Ref GsiName
+          GSI_PK_ATTRIBUTE:        !Ref GsiPartitionKeyAttribute
+          GSI_PK_VALUE:            !Ref GsiPartitionKeyValue
+          GSI_SK_ATTRIBUTE:        !Ref GsiSortKeyAttribute
+          DATE_FORMAT:             !Ref DateFormat
+          DATE_RANGE_MODE:         !Ref DateRangeMode
+          LOOKBACK_HOURS:          !Ref LookbackHours
+          S3_BUCKET:               !Ref S3BucketName
+          S3_PREFIX:               !Ref S3DataPrefix
+          OVERWRITE_MODE:          !Ref OverwriteMode
+          EXTRA_DATE_COLUMN:       !Ref ExtraDateColumn
+          LOG_LEVEL:               'INFO'
+      Code:
+        ZipFile: |
+          """
+          Queries a DynamoDB GSI by a single partition key + date range on the
+          sort key, then writes the result as Parquet to S3 for Athena.
+          """
+          import os
+          import logging
+          import uuid
+          from datetime import datetime, timedelta, timezone
+
+          import boto3
+          import awswrangler as wr
+          import pandas as pd
+          from boto3.dynamodb.conditions import Key
+
+          # ── logging ─────────────────────────────────────────────────────
+          logger = logging.getLogger(__name__)
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          # ── timezone abbreviation map ───────────────────────────────────
+          TZ_MAP = {
+              'EST': timezone(timedelta(hours=-5)),
+              'EDT': timezone(timedelta(hours=-4)),
+              'CST': timezone(timedelta(hours=-6)),
+              'CDT': timezone(timedelta(hours=-5)),
+              'MST': timezone(timedelta(hours=-7)),
+              'MDT': timezone(timedelta(hours=-6)),
+              'PST': timezone(timedelta(hours=-8)),
+              'PDT': timezone(timedelta(hours=-7)),
+              'UTC': timezone.utc,
+              'GMT': timezone.utc,
+          }
+          HUMAN_FMT = '%B %d, %Y %I:%M:%S %p'   # February 16, 2026 09:58:00 AM
+
+          def parse_human_date(s: str) -> datetime:
+              """Parse 'February 16, 2026 09:58:00 AM EST' into a tz-aware datetime."""
+              parts = s.rsplit(' ', 1)
+              if len(parts) == 2 and parts[1] in TZ_MAP:
+                  dt = datetime.strptime(parts[0], HUMAN_FMT)
+                  return dt.replace(tzinfo=TZ_MAP[parts[1]])
+              dt = datetime.strptime(s, HUMAN_FMT)
+              return dt.replace(tzinfo=timezone.utc)
+
+          # ── env vars ──────────────────────────────────────────────────────
+          TABLE_NAME      = os.environ['DYNAMO_TABLE_NAME']
+          GSI_NAME        = os.environ['GSI_NAME']
+          GSI_PK_ATTR     = os.environ['GSI_PK_ATTRIBUTE']
+          GSI_PK_VALUE    = os.environ['GSI_PK_VALUE']
+          GSI_SK_ATTR     = os.environ['GSI_SK_ATTRIBUTE']
+          DATE_FORMAT     = os.environ['DATE_FORMAT']
+          DATE_RANGE_MODE = os.environ['DATE_RANGE_MODE']
+          LOOKBACK_HOURS  = int(os.environ.get('LOOKBACK_HOURS', 24))
+          S3_BUCKET       = os.environ['S3_BUCKET']
+          S3_PREFIX       = os.environ['S3_PREFIX']
+          OVERWRITE_MODE  = os.environ['OVERWRITE_MODE']
+          EXTRA_DATE_COL  = os.environ.get('EXTRA_DATE_COLUMN', '')
+
+          dynamodb = boto3.resource('dynamodb')
+          table    = dynamodb.Table(TABLE_NAME)
+
+          logger.info(
+              "Lambda cold start — table=%s gsi=%s pk_attr=%s pk_val=%s "
+              "sk_attr=%s date_fmt=%s range_mode=%s overwrite=%s",
+              TABLE_NAME, GSI_NAME, GSI_PK_ATTR, GSI_PK_VALUE,
+              GSI_SK_ATTR, DATE_FORMAT, DATE_RANGE_MODE, OVERWRITE_MODE,
+          )
+
+
+          # ── helpers ───────────────────────────────────────────────────────
+
+          def compute_date_range() -> tuple:
+              """Return (start_dt, end_dt) as UTC-aware datetimes."""
+              now = datetime.now(timezone.utc)
+
+              if DATE_RANGE_MODE == 'PREVIOUS_DAY':
+                  yesterday = (now - timedelta(days=1)).date()
+                  start = datetime(yesterday.year, yesterday.month, yesterday.day,
+                                   tzinfo=timezone.utc)
+                  end   = start + timedelta(days=1) - timedelta(seconds=1)
+
+              elif DATE_RANGE_MODE == 'PREVIOUS_WEEK':
+                  today      = now.date()
+                  monday_this_week = today - timedelta(days=today.weekday())
+                  monday_last_week = monday_this_week - timedelta(weeks=1)
+                  sunday_last_week = monday_last_week + timedelta(days=6)
+                  start = datetime(monday_last_week.year, monday_last_week.month,
+                                   monday_last_week.day, tzinfo=timezone.utc)
+                  end   = datetime(sunday_last_week.year, sunday_last_week.month,
+                                   sunday_last_week.day, 23, 59, 59,
+                                   tzinfo=timezone.utc)
+
+              else:  # LAST_N_HOURS
+                  end   = now
+                  start = now - timedelta(hours=LOOKBACK_HOURS)
+
+              logger.info("Computed date range: %s -> %s (mode=%s)",
+                          start.isoformat(), end.isoformat(), DATE_RANGE_MODE)
+              return start, end
+
+
+          def to_sk_value(dt: datetime) -> str | float:
+              """Convert a datetime to the sort key format used in DynamoDB."""
+              if DATE_FORMAT == 'EPOCH':
+                  return dt.timestamp()
+              if DATE_FORMAT == 'HUMAN_READABLE':
+                  est = TZ_MAP.get('EST', timezone(timedelta(hours=-5)))
+                  local_dt = dt.astimezone(est)
+                  return local_dt.strftime(HUMAN_FMT) + ' EST'
+              # ISO with microseconds and explicit offset to match
+              # formats like 2026-02-16T14:56:40.288000+00:00
+              return dt.strftime('%Y-%m-%dT%H:%M:%S.%f') + '+00:00'
+
+
+          def query_gsi(start_dt: datetime, end_dt: datetime) -> list[dict]:
+              """Page through the GSI and return all matching items as plain dicts."""
+              start_val = to_sk_value(start_dt)
+              end_val   = to_sk_value(end_dt)
+
+              logger.info("Querying GSI '%s': %s=%s, %s between %s and %s",
+                          GSI_NAME, GSI_PK_ATTR, GSI_PK_VALUE,
+                          GSI_SK_ATTR, start_val, end_val)
+
+              key_condition = (
+                  Key(GSI_PK_ATTR).eq(GSI_PK_VALUE) &
+                  Key(GSI_SK_ATTR).between(start_val, end_val)
+              )
+
+              kwargs = {
+                  'IndexName': GSI_NAME,
+                  'KeyConditionExpression': key_condition,
+              }
+
+              items = []
+              page = 0
+              while True:
+                  response = table.query(**kwargs)
+                  page_items = response.get('Items', [])
+                  items.extend(page_items)
+                  page += 1
+                  logger.debug("Page %d returned %d item(s), running total=%d",
+                               page, len(page_items), len(items))
+                  last = response.get('LastEvaluatedKey')
+                  if not last:
+                      break
+                  kwargs['ExclusiveStartKey'] = last
+
+              logger.info("GSI query complete — %d item(s) fetched across %d page(s)",
+                          len(items), page)
+              return items
+
+
+          def build_s3_key(start_dt: datetime, end_dt: datetime) -> str:
+              """
+              Hive-style partitioned key.
+              Partition is based on the START of the date range so Athena
+              partition projection lines up consistently.
+              """
+              y = start_dt.year
+              m = start_dt.month
+              d = start_dt.day
+
+              if OVERWRITE_MODE == 'OVERWRITE':
+                  filename = 'data.parquet'
+              else:
+                  filename = (
+                      f"{datetime.now(timezone.utc).strftime('%H%M%S')}"
+                      f"-{uuid.uuid4().hex[:8]}.parquet"
+                  )
+
+              key = f"{S3_PREFIX}/year={y}/month={m:02d}/day={d:02d}/{filename}"
+              logger.info("S3 key: %s (mode=%s)", key, OVERWRITE_MODE)
+              return key
+
+
+          def sk_to_date(sk_val) -> str | None:
+              """Extract YYYY-MM-DD from a sort-key value."""
+              try:
+                  if DATE_FORMAT == 'EPOCH':
+                      dt = datetime.fromtimestamp(float(sk_val), tz=timezone.utc)
+                  elif DATE_FORMAT == 'HUMAN_READABLE':
+                      dt = parse_human_date(str(sk_val))
+                  else:
+                      dt = datetime.fromisoformat(str(sk_val).replace('Z', '+00:00'))
+                  return dt.strftime('%Y-%m-%d')
+              except Exception:
+                  return None
+
+
+          def write_parquet(items: list[dict], s3_key: str) -> None:
+              """Convert items to a DataFrame and upload as Parquet via awswrangler."""
+              if not items:
+                  logger.warning("No items to write — skipping S3 upload.")
+                  return
+
+              df = pd.DataFrame(items)
+
+              # Add extra date column derived from GSI sort key
+              if EXTRA_DATE_COL and GSI_SK_ATTR in df.columns:
+                  df[EXTRA_DATE_COL] = df[GSI_SK_ATTR].apply(sk_to_date)
+                  logger.info("Added extra date column '%s'", EXTRA_DATE_COL)
+
+              logger.info("DataFrame created — %d row(s), %d column(s): %s",
+                          len(df), len(df.columns), list(df.columns))
+
+              # Decimal types from DynamoDB boto3 resource need casting
+              for col in df.columns:
+                  if df[col].dtype == object:
+                      try:
+                          df[col] = df[col].apply(
+                              lambda x: float(x) if hasattr(x, 'as_tuple') else x
+                          )
+                      except Exception:
+                          logger.debug("Could not cast column '%s' from Decimal", col)
+
+              s3_path = f"s3://{S3_BUCKET}/{s3_key}"
+
+              wr.s3.to_parquet(
+                  df=df,
+                  path=s3_path,
+                  index=False,
+                  compression='snappy',
+              )
+              logger.info("Wrote %d row(s) to %s", len(df), s3_path)
+
+
+          # ── handler ───────────────────────────────────────────────────────
+
+          def lambda_handler(event, context):
+              request_id = getattr(context, 'aws_request_id', 'local')
+              logger.info("Invocation start — request_id=%s", request_id)
+
+              start_dt, end_dt = compute_date_range()
+              items  = query_gsi(start_dt, end_dt)
+              s3_key = build_s3_key(start_dt, end_dt)
+              write_parquet(items, s3_key)
+
+              logger.info("Invocation complete — request_id=%s items=%d s3_key=%s",
+                          request_id, len(items), s3_key)
+
+              return {
+                  'statusCode': 200,
+                  'itemCount': len(items),
+                  's3Key': s3_key,
+              }
+
+  # -------------------------------------------------------------------------
+  # 5. EventBridge Scheduled Rule
+  # -------------------------------------------------------------------------
+  ExportScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-export-schedule'
+      Description: Triggers the DynamoDB GSI export Lambda on a cron schedule
+      ScheduleExpression: !Ref CronExpression
+      State: ENABLED
+      Targets:
+        - Id: ExportLambdaTarget
+          Arn: !GetAtt ExportLambdaFunction.Arn
+
+  ExportSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ExportLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExportScheduleRule.Arn
+
+  # -------------------------------------------------------------------------
+  # 6. Athena Workgroup + Saved Queries (partition projection, no Glue)
+  # -------------------------------------------------------------------------
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-workgroup'
+      Description: Workgroup for querying DynamoDB GSI export data
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB safety limit
+
+  AthenaCreateDatabaseQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref AthenaWorkgroup
+      Name: !Sub '${AWS::StackName}-01-create-database'
+      Description: Step 1 - Run once to create the Athena database
+      Database: default
+      QueryString: !Sub |
+        CREATE DATABASE IF NOT EXISTS `${AWS::StackName}_db`
+        COMMENT 'DynamoDB GSI export data - managed by ${AWS::StackName}';
+
+  AthenaCreateTableQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref AthenaWorkgroup
+      Name: !Sub '${AWS::StackName}-02-create-table'
+      Description: >
+        Step 2 - Run once to create the Parquet table with partition projection.
+        Edit the column list to match your DynamoDB item attributes.
+      Database: !Sub '${AWS::StackName}_db'
+      QueryString: !Sub
+        - |
+          CREATE EXTERNAL TABLE IF NOT EXISTS gsi_export (
+            -- ----------------------------------------------------------------
+            -- Replace / extend these columns to match your DynamoDB attributes.
+            -- Column types should match what DynamoDB stores. DynamoDB Number
+            -- types are written as DOUBLE in Parquet (via Decimal->float cast).
+            -- Use STRING for text, DOUBLE for numbers, BOOLEAN for booleans.
+            -- ----------------------------------------------------------------
+            pk        STRING,
+            sk        STRING
+            -- add more columns here, e.g.:
+            -- status   STRING,
+            -- amount   DOUBLE,
+            -- is_active BOOLEAN
+          )
+          PARTITIONED BY (
+            year  INT,
+            month INT,
+            day   INT
+          )
+          STORED AS PARQUET
+          LOCATION 's3://${S3BucketName}/${S3DataPrefix}/'
+          TBLPROPERTIES (
+            'parquet.compress'          = 'SNAPPY',
+            'projection.enabled'        = 'true',
+
+            'projection.year.type'      = 'integer',
+            'projection.year.range'     = '${YearRange}',
+
+            'projection.month.type'     = 'integer',
+            'projection.month.range'    = '1,12',
+            'projection.month.digits'   = '2',
+
+            'projection.day.type'       = 'integer',
+            'projection.day.range'      = '1,31',
+            'projection.day.digits'     = '2',
+
+            'storage.location.template' =
+              's3://${S3BucketName}/${S3DataPrefix}/year=${!year}/month=${!month}/day=${!day}'
+          );
+        - YearRange: !Ref ProjectionYearRange
+
+  AthenaSampleQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref AthenaWorkgroup
+      Name: !Sub '${AWS::StackName}-03-sample-select'
+      Description: Sample query - records for today's partition
+      Database: !Sub '${AWS::StackName}_db'
+      QueryString: |
+        SELECT *
+        FROM gsi_export
+        WHERE year  = year(current_date)
+          AND month = month(current_date)
+          AND day   = day_of_month(current_date)
+        LIMIT 100;
+
+  AthenaDateRangeQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref AthenaWorkgroup
+      Name: !Sub '${AWS::StackName}-04-custom-date-range'
+      Description: Query across a custom date range using partition pruning
+      Database: !Sub '${AWS::StackName}_db'
+      QueryString: |
+        SELECT *
+        FROM gsi_export
+        WHERE year  = 2024
+          AND month = 1
+          AND day   BETWEEN 1 AND 7
+        LIMIT 100;
+
+  # -------------------------------------------------------------------------
+  # 7. Athena Auto-Setup — Custom Resource that runs CREATE DATABASE
+  #    and CREATE TABLE DDL at deploy time. Drops both on stack delete.
+  # -------------------------------------------------------------------------
+  AthenaSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-athena-setup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaDDL
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetWorkGroup
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-workgroup'
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:DeleteDatabase
+                  - glue:GetDatabase
+                  - glue:CreateTable
+                  - glue:DeleteTable
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}_db'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}_db/*'
+              - Sid: S3Results
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results/*'
+              - Sid: S3DataLocation
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  AthenaSetupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-athena-setup'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AthenaSetupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AthenaSetupLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-athena-setup'
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt AthenaSetupRole.Arn
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Sub '${AWS::StackName}_db'
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          TABLE_LOCATION: !Sub 's3://${S3BucketName}/${S3DataPrefix}/'
+          YEAR_RANGE: !Ref ProjectionYearRange
+      Code:
+        ZipFile: |
+          """
+          Custom Resource Lambda — creates / drops the Athena database
+          and table automatically when the CloudFormation stack is
+          created or deleted.
+          """
+          import os
+          import time
+          import json
+          import logging
+          import urllib.request
+
+          import boto3
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel('INFO')
+
+          athena = boto3.client('athena')
+
+          DATABASE  = os.environ['ATHENA_DATABASE']
+          WORKGROUP = os.environ['ATHENA_WORKGROUP']
+          LOCATION  = os.environ['TABLE_LOCATION']
+          YR_RANGE  = os.environ['YEAR_RANGE']
+
+
+          def run_ddl(sql):
+              logger.info("DDL: %s", sql[:400])
+              resp = athena.start_query_execution(
+                  QueryString=sql,
+                  WorkGroup=WORKGROUP,
+              )
+              qid = resp['QueryExecutionId']
+              while True:
+                  ex = athena.get_query_execution(
+                      QueryExecutionId=qid)
+                  state = ex['QueryExecution'][
+                      'Status']['State']
+                  if state in ('SUCCEEDED',
+                               'FAILED', 'CANCELLED'):
+                      break
+                  time.sleep(1)
+              if state != 'SUCCEEDED':
+                  reason = ex['QueryExecution'][
+                      'Status'].get(
+                      'StateChangeReason', 'Unknown')
+                  raise Exception(
+                      f"DDL {state}: {reason}")
+              logger.info("DDL succeeded: %s", qid)
+              return qid
+
+
+          def send_cfn(event, context, status, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or context.log_group_name,
+                  'PhysicalResourceId':
+                      f'{DATABASE}-athena-setup',
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId':
+                      event['LogicalResourceId'],
+              })
+              req = urllib.request.Request(
+                  event['ResponseURL'],
+                  data=body.encode(),
+                  headers={'Content-Type': ''},
+                  method='PUT',
+              )
+              urllib.request.urlopen(req)
+
+
+          def handler(event, context):
+              rt = event['RequestType']
+              logger.info("CustomResource %s — db=%s",
+                          rt, DATABASE)
+              try:
+                  db = f'"{DATABASE}"'
+
+                  if rt in ('Create', 'Update'):
+                      run_ddl(
+                          f"CREATE DATABASE IF NOT EXISTS"
+                          f" {db}")
+
+                      loc = LOCATION
+                      yr = YR_RANGE
+                      run_ddl(f"""
+          CREATE EXTERNAL TABLE IF NOT EXISTS
+          {db}.gsi_export (
+            initialcontactid STRING,
+            agentid STRING,
+            agentname STRING,
+            agentusername STRING,
+            channel STRING,
+            connectedtoagenttimestamp STRING,
+            connectedtosystemtimestamp STRING,
+            contactid STRING,
+            createdat STRING,
+            customerendpointaddress STRING,
+            describedcontactid STRING,
+            initiationmethod STRING,
+            initiationtimestamp STRING,
+            lastupdatetimestamp STRING,
+            originalcontactchannel STRING,
+            previouscontactid STRING,
+            relatedcontactid STRING,
+            systemendpointaddress STRING,
+            ttl DOUBLE,
+            viewaction STRING,
+            report_date STRING
+          )
+          PARTITIONED BY (year INT, month INT, day INT)
+          STORED AS PARQUET
+          LOCATION '{loc}'
+          TBLPROPERTIES (
+            'parquet.compress'='SNAPPY',
+            'projection.enabled'='true',
+            'projection.year.type'='integer',
+            'projection.year.range'='{yr}',
+            'projection.month.type'='integer',
+            'projection.month.range'='1,12',
+            'projection.month.digits'='2',
+            'projection.day.type'='integer',
+            'projection.day.range'='1,31',
+            'projection.day.digits'='2',
+            'storage.location.template'=
+              '{loc}year=${{year}}/month=${{month}}/day=${{day}}'
+          )""")
+
+                  elif rt == 'Delete':
+                      try:
+                          run_ddl(
+                              f"DROP TABLE IF EXISTS"
+                              f" {db}.gsi_export")
+                          run_ddl(
+                              f"DROP DATABASE IF EXISTS"
+                              f" {db} CASCADE")
+                      except Exception as e:
+                          logger.warning(
+                              "Drop failed (ok): %s",
+                              str(e))
+
+                  send_cfn(event, context, 'SUCCESS')
+
+              except Exception as e:
+                  logger.error("Error: %s", str(e))
+                  send_cfn(event, context,
+                           'FAILED', str(e))
+
+  AthenaSetup:
+    Type: Custom::AthenaSetup
+    DependsOn:
+      - AthenaWorkgroup
+      - AthenaResultsBucket
+    Properties:
+      ServiceToken: !GetAtt AthenaSetupFunction.Arn
+
+  # -------------------------------------------------------------------------
+  # 8. Report Query Lambda — queries Athena, returns CSV
+  #
+  #    Query types (pass as "query" in the event payload):
+  #      all_records    — SELECT * (optional limit)
+  #      by_date        — filter by report_date range
+  #      by_agent       — filter by AgentName
+  #      by_contact     — lookup by ContactId
+  #      daily_summary    — contacts per day & agent (optional date range)
+  #      channel_summary  — contacts per day & channel (optional date range)
+  #      custom_sql     — any SQL you provide
+  #
+  #    Add "presignedUrl": true for a 1-hour download link.
+  #
+  #    Example:
+  #      aws lambda invoke --function-name <stack>-report-query \
+  #        --payload '{"query":"by_date","startDate":"2026-02-14",
+  #                    "endDate":"2026-02-18","presignedUrl":true}' out.json
+  # -------------------------------------------------------------------------
+  ReportQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-report-query-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaQueryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetWorkGroup
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-workgroup'
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}_db'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}_db/*'
+              - Sid: S3DataRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Sid: S3ResultsAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}-athena-results/*'
+
+  ReportQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-report-query'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReportQueryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ReportQueryLogGroup
+      - AthenaSetup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-report-query'
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt ReportQueryRole.Arn
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Sub '${AWS::StackName}_db'
+          ATHENA_TABLE: gsi_export
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          """
+          Report Query + Web Dashboard Lambda.
+          Serves an HTML dashboard via Function URL AND handles
+          direct Lambda invocations for backwards compatibility.
+          """
+          import os, time, json, logging, urllib.parse
+          import boto3
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          DATABASE  = os.environ['ATHENA_DATABASE']
+          TABLE     = os.environ['ATHENA_TABLE']
+          WORKGROUP = os.environ['ATHENA_WORKGROUP']
+          TBL       = f'"{DATABASE}"."{TABLE}"'
+
+          athena = boto3.client('athena')
+          s3     = boto3.client('s3')
+
+          QUERY_OPTIONS = [
+              'all_records','by_date','by_agent',
+              'by_contact','daily_summary','channel_summary','custom_sql',
+          ]
+
+          # ---- shared helpers ----
+
+          def sanitize(v):
+              return str(v).replace("'", "''")
+
+          def run_query(sql):
+              logger.info("SQL: %s", sql[:500])
+              resp = athena.start_query_execution(
+                  QueryString=sql, WorkGroup=WORKGROUP)
+              qid = resp['QueryExecutionId']
+              logger.info("Query started id=%s", qid)
+              while True:
+                  ex = athena.get_query_execution(QueryExecutionId=qid)
+                  st = ex['QueryExecution']['Status']['State']
+                  if st in ('SUCCEEDED','FAILED','CANCELLED'):
+                      break
+                  time.sleep(1)
+              if st != 'SUCCEEDED':
+                  reason = ex['QueryExecution']['Status'].get(
+                      'StateChangeReason','Unknown')
+                  logger.error("Query %s: %s", st, reason)
+                  return {'statusCode':500,'error':reason,
+                          'queryExecutionId':qid}
+              loc = ex['QueryExecution']['ResultConfiguration']['OutputLocation']
+              stats = ex['QueryExecution'].get('Statistics',{})
+              return {
+                  'statusCode':200,'queryExecutionId':qid,
+                  'csvLocation':loc,
+                  'dataScannedBytes':stats.get('DataScannedInBytes',0),
+                  'runtimeMs':stats.get('EngineExecutionTimeInMillis',0),
+              }
+
+          def presign(s3_uri, expiry=3600):
+              p = urllib.parse.urlparse(s3_uri)
+              return s3.generate_presigned_url(
+                  'get_object',
+                  Params={'Bucket':p.netloc,'Key':p.path.lstrip('/')},
+                  ExpiresIn=expiry)
+
+          def fetch_rows(qid, max_rows=500):
+              rows, cols, kwargs = [], None, {
+                  'QueryExecutionId':qid,'MaxResults':100}
+              while len(rows) < max_rows:
+                  r = athena.get_query_results(**kwargs)
+                  rs = r['ResultSet']
+                  if cols is None:
+                      cols = [c['Name'] for c in
+                              rs['ResultSetMetadata']['ColumnInfo']]
+                      drows = rs['Rows'][1:]
+                  else:
+                      drows = rs['Rows']
+                  for row in drows:
+                      vals = [d.get('VarCharValue','') for d in row['Data']]
+                      rows.append(dict(zip(cols, vals)))
+                  tok = r.get('NextToken')
+                  if not tok or len(rows) >= max_rows:
+                      break
+                  kwargs['NextToken'] = tok
+              return rows[:max_rows]
+
+          def build_sql(body):
+              qtype = body.get('query','all_records')
+              limit = int(body.get('limit',1000))
+              if qtype == 'all_records':
+                  return f"SELECT * FROM {TBL} LIMIT {limit}"
+              elif qtype == 'by_date':
+                  sd = sanitize(body.get('startDate',''))
+                  ed = sanitize(body.get('endDate',''))
+                  if not sd or not ed:
+                      return None
+                  return (f"SELECT * FROM {TBL} "
+                          f"WHERE report_date BETWEEN '{sd}' AND '{ed}' "
+                          f"LIMIT {limit}")
+              elif qtype == 'by_agent':
+                  a = sanitize(body.get('agentName',''))
+                  if not a: return None
+                  return (f"SELECT * FROM {TBL} "
+                          f"WHERE agentname = '{a}' LIMIT {limit}")
+              elif qtype == 'by_contact':
+                  c = sanitize(body.get('contactId',''))
+                  if not c: return None
+                  return (f"SELECT * FROM {TBL} "
+                          f"WHERE contactid = '{c}' LIMIT {limit}")
+              elif qtype == 'daily_summary':
+                  sd = sanitize(body.get('startDate',''))
+                  ed = sanitize(body.get('endDate',''))
+                  where = (f"WHERE report_date BETWEEN '{sd}' AND '{ed}' "
+                           if sd and ed else '')
+                  return (f"SELECT report_date, agentname, "
+                          f"COUNT(*) as contacts, "
+                          f"COUNT(DISTINCT contactid) as unique_contacts "
+                          f"FROM {TBL} {where}"
+                          f"GROUP BY report_date, agentname "
+                          f"ORDER BY report_date, agentname "
+                          f"LIMIT {limit}")
+              elif qtype == 'channel_summary':
+                  sd = sanitize(body.get('startDate',''))
+                  ed = sanitize(body.get('endDate',''))
+                  where = (f"WHERE report_date BETWEEN '{sd}' AND '{ed}' "
+                           if sd and ed else '')
+                  return (f"SELECT report_date, originalcontactchannel, "
+                          f"COUNT(*) as contacts, "
+                          f"COUNT(DISTINCT contactid) as unique_contacts "
+                          f"FROM {TBL} {where}"
+                          f"GROUP BY report_date, originalcontactchannel "
+                          f"ORDER BY report_date, originalcontactchannel "
+                          f"LIMIT {limit}")
+              elif qtype == 'custom_sql':
+                  sql = body.get('sql','').strip()
+                  if not sql or not sql.upper().startswith('SELECT'):
+                      return None
+                  return sql
+              return None
+
+          # ---- stats cache (warm Lambda reuse) ----
+          _stats_cache = {'data':None,'ts':0}
+
+          def get_stats():
+              now = time.time()
+              if _stats_cache['data'] and now - _stats_cache['ts'] < 300:
+                  return _stats_cache['data']
+              st = {}
+              def qval(sql):
+                  r = run_query(sql)
+                  if r.get('statusCode') == 200:
+                      return fetch_rows(r['queryExecutionId'], 500)
+                  return []
+              rows = qval(f"SELECT COUNT(*) as total FROM {TBL}")
+              st['totalContacts'] = rows[0]['total'] if rows else '0'
+              rows = qval(f"SELECT COUNT(*) as cnt FROM {TBL} "
+                          f"WHERE report_date = CAST(current_date AS VARCHAR)")
+              st['todayContacts'] = rows[0]['cnt'] if rows else '0'
+              st['contactsByDay'] = qval(
+                  f"SELECT report_date, COUNT(*) as cnt FROM {TBL} "
+                  f"WHERE report_date IS NOT NULL "
+                  f"GROUP BY report_date ORDER BY report_date DESC LIMIT 30")
+              st['contactsByAgent'] = qval(
+                  f"SELECT agentname, COUNT(*) as cnt FROM {TBL} "
+                  f"WHERE agentname IS NOT NULL AND agentname != '' "
+                  f"GROUP BY agentname ORDER BY cnt DESC LIMIT 20")
+              st['contactsByChannel'] = qval(
+                  f"SELECT originalcontactchannel, COUNT(*) as cnt FROM {TBL} "
+                  f"WHERE originalcontactchannel IS NOT NULL "
+                  f"GROUP BY originalcontactchannel ORDER BY cnt DESC")
+              st['contactsByInitiation'] = qval(
+                  f"SELECT initiationmethod, COUNT(*) as cnt FROM {TBL} "
+                  f"WHERE initiationmethod IS NOT NULL "
+                  f"GROUP BY initiationmethod ORDER BY cnt DESC")
+              st['recentContacts'] = qval(
+                  f"SELECT contactid, agentname, channel, "
+                  f"initiationmethod, initiationtimestamp, report_date "
+                  f"FROM {TBL} "
+                  f"ORDER BY initiationtimestamp DESC LIMIT 10")
+              _stats_cache['data'] = st
+              _stats_cache['ts'] = now
+              return st
+
+          # ---- HTTP helpers ----
+
+          def html_resp(body, code=200):
+              return {'statusCode':code,
+                      'headers':{'Content-Type':'text/html; charset=utf-8'},
+                      'body':body}
+
+          def json_resp(data, code=200):
+              return {'statusCode':code,
+                      'headers':{'Content-Type':'application/json'},
+                      'body':json.dumps(data, default=str)}
+
+          # ---- HTTP handler (Function URL) ----
+
+          def handle_http(event, context):
+              method = event['requestContext']['http']['method']
+              path = event['requestContext']['http']['path']
+              logger.info("HTTP %s %s", method, path)
+
+              if method == 'GET' and path == '/':
+                  return html_resp(DASHBOARD_HTML)
+
+              if method == 'GET' and path == '/api/stats':
+                  qs = event.get('queryStringParameters',{}) or {}
+                  if qs.get('refresh'):
+                      _stats_cache['ts'] = 0
+                  return json_resp(get_stats())
+
+              if method == 'POST' and path == '/api/query':
+                  body = json.loads(event.get('body','{}') or '{}')
+                  sql = build_sql(body)
+                  if not sql:
+                      return json_resp({'error':'Missing or invalid parameters'},400)
+                  r = run_query(sql)
+                  return json_resp(r)
+
+              if method == 'GET' and path == '/api/results':
+                  qs = event.get('queryStringParameters',{}) or {}
+                  qid = qs.get('queryExecutionId','')
+                  if not qid:
+                      return json_resp({'error':'queryExecutionId required'},400)
+                  try:
+                      return json_resp(fetch_rows(qid))
+                  except Exception as e:
+                      return json_resp({'error':str(e)},500)
+
+              if method == 'GET' and path == '/api/download':
+                  qs = event.get('queryStringParameters',{}) or {}
+                  qid = qs.get('queryExecutionId','')
+                  if not qid:
+                      return json_resp({'error':'queryExecutionId required'},400)
+                  try:
+                      ex = athena.get_query_execution(QueryExecutionId=qid)
+                      loc = ex['QueryExecution']['ResultConfiguration']['OutputLocation']
+                      url = presign(loc)
+                      return {'statusCode':302,
+                              'headers':{'Location':url},'body':''}
+                  except Exception as e:
+                      return json_resp({'error':str(e)},500)
+
+              if method == 'GET' and path == '/api/daily':
+                  qs = event.get('queryStringParameters',{}) or {}
+                  fr = sanitize(qs.get('from',''))
+                  to = sanitize(qs.get('to',''))
+                  if not fr or not to:
+                      return json_resp({'error':'from and to required'},400)
+                  sql = (f"SELECT report_date, COUNT(*) as cnt FROM {TBL} "
+                         f"WHERE report_date BETWEEN '{fr}' AND '{to}' "
+                         f"GROUP BY report_date ORDER BY report_date")
+                  r = run_query(sql)
+                  if r.get('statusCode') != 200:
+                      return json_resp(r, r.get('statusCode',500))
+                  rows = fetch_rows(r['queryExecutionId'], 500)
+                  return json_resp(rows)
+
+              return json_resp({'error':'Not found'},404)
+
+          # ---- Direct invocation handler (backwards compat) ----
+
+          def handle_direct(event, context):
+              sql = build_sql(event)
+              if not sql:
+                  return {'statusCode':400,
+                          'error':'Missing or invalid parameters',
+                          'availableQueries':QUERY_OPTIONS}
+              result = run_query(sql)
+              if event.get('presignedUrl') and result.get('csvLocation'):
+                  result['downloadUrl'] = presign(
+                      result['csvLocation'],
+                      int(event.get('urlExpiry',3600)))
+              return result
+
+          # ---- Main handler ----
+
+          def handler(event, context):
+              rc = event.get('requestContext',{})
+              if 'http' in rc:
+                  return handle_http(event, context)
+              return handle_direct(event, context)
+
+          # ---- Dashboard HTML ----
+
+          DASHBOARD_HTML = """<!DOCTYPE html>
+          <html lang="en"><head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Contact Center Dashboard</title>
+          <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+          <style>
+          :root,[data-theme="light"]{
+          --bg:#f0f2f5;--text:#333;--card-bg:#fff;--card-sh:rgba(0,0,0,.08);
+          --hdr1:#1a73e8;--hdr2:#0d47a1;--accent:#1a73e8;--accent-h:#1557b0;
+          --inp-bg:#fff;--inp-bdr:#ddd;--inp-txt:#333;
+          --th-bg:#f8f9fa;--row-h:#f0f4ff;--bdr:#eee;
+          --muted:#888;--sub:#555;--panel:#fff;--green:#34a853;--green-h:#2d8e47}
+          [data-theme="dark"]{
+          --bg:#1a1a2e;--text:#e0e0e0;--card-bg:#16213e;--card-sh:rgba(0,0,0,.4);
+          --hdr1:#0f3460;--hdr2:#1a1a2e;--accent:#4fc3f7;--accent-h:#29b6f6;
+          --inp-bg:#16213e;--inp-bdr:#3a3a5c;--inp-txt:#e0e0e0;
+          --th-bg:#16213e;--row-h:#1b2a4a;--bdr:#2a2a4a;
+          --muted:#999;--sub:#bbb;--panel:#16213e;--green:#43a047;--green-h:#388e3c}
+          [data-theme="ocean"]{
+          --bg:#e0f7fa;--text:#263238;--card-bg:#fff;--card-sh:rgba(0,0,0,.08);
+          --hdr1:#00838f;--hdr2:#006064;--accent:#00838f;--accent-h:#006064;
+          --inp-bg:#fff;--inp-bdr:#b2dfdb;--inp-txt:#263238;
+          --th-bg:#e0f2f1;--row-h:#b2ebf2;--bdr:#b2dfdb;
+          --muted:#607d8b;--sub:#455a64;--panel:#fff;--green:#00897b;--green-h:#00695c}
+          [data-theme="sunset"]{
+          --bg:#fff3e0;--text:#3e2723;--card-bg:#fff;--card-sh:rgba(0,0,0,.08);
+          --hdr1:#e65100;--hdr2:#bf360c;--accent:#e65100;--accent-h:#bf360c;
+          --inp-bg:#fff;--inp-bdr:#ffccbc;--inp-txt:#3e2723;
+          --th-bg:#fbe9e7;--row-h:#ffe0b2;--bdr:#ffccbc;
+          --muted:#8d6e63;--sub:#5d4037;--panel:#fff;--green:#558b2f;--green-h:#33691e}
+          *{box-sizing:border-box;margin:0;padding:0}
+          body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+          background:var(--bg);color:var(--text);padding:20px;transition:background .3s,color .3s}
+          header{background:linear-gradient(135deg,var(--hdr1),var(--hdr2));color:#fff;
+          padding:20px 30px;border-radius:10px;margin-bottom:20px;
+          display:flex;justify-content:space-between;align-items:center}
+          h1{font-size:1.4em}
+          .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+          gap:14px;margin-bottom:22px}
+          .card{background:var(--card-bg);border-radius:10px;padding:18px;
+          box-shadow:0 2px 6px var(--card-sh);text-align:center;transition:background .3s}
+          .card h3{font-size:.78em;color:var(--muted);text-transform:uppercase;
+          letter-spacing:.5px;margin-bottom:6px}
+          .card .val{font-size:2.2em;font-weight:700;color:var(--accent)}
+          .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));
+          gap:14px;margin-bottom:22px}
+          .chart-box{background:var(--card-bg);border-radius:10px;padding:18px;
+          box-shadow:0 2px 6px var(--card-sh);transition:background .3s}
+          .chart-box h3{font-size:.9em;color:var(--sub);margin-bottom:10px}
+          section{margin-bottom:22px}
+          table{width:100%;border-collapse:collapse;font-size:.85em}
+          th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bdr)}
+          th{background:var(--th-bg);font-weight:600;position:sticky;top:0;z-index:1;
+          color:var(--text)}
+          td{color:var(--text)}
+          tr:hover{background:var(--row-h)}
+          .panel{background:var(--panel);border-radius:10px;padding:22px;
+          box-shadow:0 2px 6px var(--card-sh);transition:background .3s}
+          .qform{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:14px 0}
+          .qform label{display:flex;flex-direction:column;font-size:.82em;color:var(--sub)}
+          .qform input,.qform select,.qform textarea{padding:8px;
+          border:1px solid var(--inp-bdr);border-radius:6px;margin-top:3px;font-size:.95em;
+          background:var(--inp-bg);color:var(--inp-txt)}
+          .qform textarea{width:100%;min-width:100%;font-family:'Consolas','Courier New',monospace;
+          font-size:.85em;line-height:1.5;resize:vertical}
+          .sql-example{margin-top:6px;padding:10px 14px;background:var(--th-bg);border:1px solid var(--bdr);
+          border-radius:6px;font-family:'Consolas','Courier New',monospace;font-size:.82em;
+          color:var(--sub);cursor:pointer;word-break:break-all;position:relative;transition:background .2s}
+          .sql-example:hover{background:var(--row-h)}
+          .sql-example::after{content:'Click to load into editor';position:absolute;top:4px;
+          right:8px;font-size:.75em;color:var(--muted);font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+          .sql-btns{display:flex;gap:6px;margin-top:6px}
+          .col-toggle{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;
+          background:var(--th-bg);border:1px solid var(--bdr);border-radius:4px;cursor:pointer;
+          user-select:none;transition:background .2s}
+          .col-toggle:hover{background:var(--row-h)}
+          .col-toggle input{cursor:pointer}
+          .col-toggle-all{font-weight:600;background:var(--accent);color:#fff;border-color:var(--accent);
+          padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.82em}
+          td{cursor:pointer;position:relative}
+          td:hover{background:var(--row-h)}
+          .copied-tip{position:absolute;top:-26px;left:50%;transform:translateX(-50%);
+          background:#333;color:#fff;padding:2px 8px;border-radius:4px;font-size:.72em;
+          white-space:nowrap;pointer-events:none;animation:fadeout 1.2s forwards}
+          @keyframes fadeout{0%{opacity:1}70%{opacity:1}100%{opacity:0}}
+          .btn{border:none;padding:10px 22px;border-radius:6px;cursor:pointer;
+          font-weight:600;font-size:.9em;color:#fff}
+          .btn-blue{background:var(--accent)}.btn-blue:hover{background:var(--accent-h)}
+          .btn-green{background:var(--green)}.btn-green:hover{background:var(--green-h)}
+          .status{padding:10px 14px;border-radius:6px;margin:10px 0;font-size:.9em}
+          .status-load{background:#fff3cd;color:#856404}
+          .status-ok{background:#d4edda;color:#155724}
+          .status-err{background:#f8d7da;color:#721c24}
+          .tbl-scroll{max-height:400px;overflow:auto;margin-top:10px;
+          border:1px solid var(--bdr);border-radius:6px}
+          .hide{display:none!important}
+          .results-hdr{display:flex;justify-content:space-between;
+          align-items:center;margin-top:10px}
+          .hint{color:var(--muted);font-size:.85em;margin-top:6px}
+          .theme-sel{background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.3);
+          border-radius:6px;padding:6px 12px;font-size:.85em;cursor:pointer;outline:none}
+          .theme-sel option{color:#333;background:#fff}
+          </style>
+          <script>(function(){var t=localStorage.getItem('cc-theme')||'light';
+          document.documentElement.setAttribute('data-theme',t)})()</script>
+          </head><body>
+          <header>
+          <h1>Contact Center Dashboard</h1>
+          <select class="theme-sel" id="theme-sel" onchange="setTheme(this.value)">
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+          <option value="ocean">Ocean</option>
+          <option value="sunset">Sunset</option>
+          </select>
+          </header>
+
+          <!-- Query section at top -->
+          <section class="panel">
+          <h2 style="margin-bottom:4px">Run Query</h2>
+          <div class="qform">
+          <label>Query Type<select id="qt">
+          <option value="all_records">All Records</option>
+          <option value="by_date">By Date Range</option>
+          <option value="by_agent">By Agent</option>
+          <option value="by_contact">By Contact ID</option>
+          <option value="daily_summary">Daily Summary (by Agent)</option>
+          <option value="channel_summary">Daily Summary (by Channel)</option>
+          <option value="custom_sql">Custom SQL</option>
+          </select></label>
+          <div id="p-by_date" class="hide">
+          <label>Start<input type="date" id="f-sd"></label></div>
+          <div id="p-by_date2" class="hide">
+          <label>End<input type="date" id="f-ed"></label></div>
+          <div id="p-by_agent" class="hide">
+          <label>Agent Name<input type="text" id="f-agent" placeholder="Agent name"></label></div>
+          <div id="p-by_contact" class="hide">
+          <label>Contact ID<input type="text" id="f-cid" placeholder="ID"></label></div>
+          <div id="p-custom_sql" class="hide" style="flex-basis:100%">
+          <label style="width:100%">SQL
+          <textarea id="f-sql" rows="6" placeholder="Write your SQL query here..."></textarea></label>
+          <div class="sql-btns">
+          <button class="btn" style="background:#6c757d;padding:6px 14px;font-size:.82em"
+          onclick="document.getElementById('f-sql').value='';document.getElementById('f-sql').focus()">Clear</button>
+          <button class="btn btn-blue" style="padding:6px 14px;font-size:.82em"
+          onclick="loadSqlExample()">Load Example</button>
+          </div>
+          <div class="sql-example" onclick="loadSqlExample()" title="Click to load into editor">SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date FROM "gsi-export-test_db"."gsi_export" WHERE report_date >= '2025-01-01' ORDER BY report_date DESC LIMIT 50</div>
+          </div>
+          <label>Limit<input type="number" id="f-limit" value="1000" min="1" max="10000"
+          style="width:80px"></label>
+          <button class="btn btn-blue" id="run-btn">Run Query</button>
+          </div>
+          <div id="q-status" class="hide status"></div>
+          <p class="hint" id="hint-text">Select a query type and click Run Query.
+          Statistics will be generated from the results.</p>
+          </section>
+
+          <!-- Stats cards — hidden until query runs -->
+          <div class="cards hide" id="stats-section">
+          <div class="card"><h3>Total Rows</h3><div class="val" id="s-total">--</div></div>
+          <div class="card"><h3>Unique Contacts</h3><div class="val" id="s-contacts">--</div></div>
+          <div class="card"><h3>Channels</h3><div class="val" id="s-chan">--</div></div>
+          <div class="card"><h3>Agents</h3><div class="val" id="s-agents">--</div></div>
+          </div>
+
+          <!-- Charts — hidden until query runs -->
+          <div class="charts hide" id="charts-section">
+          <div class="chart-box"><h3>Contacts Per Day</h3>
+          <canvas id="c-daily"></canvas></div>
+          <div class="chart-box"><h3>By Original Channel</h3>
+          <canvas id="c-chan"></canvas></div>
+          <div class="chart-box"><h3>By Agent</h3>
+          <canvas id="c-agent"></canvas></div>
+          <div class="chart-box"><h3>By Initiation Method</h3>
+          <canvas id="c-init"></canvas></div>
+          </div>
+
+          <!-- Results table + download -->
+          <div id="q-results" class="hide" style="margin-bottom:22px">
+          <section class="panel">
+          <div class="results-hdr">
+          <span id="q-count" style="font-weight:600"></span>
+          <button class="btn btn-green hide" id="dl-btn">Download CSV (selected columns)</button>
+          </div>
+          <div id="col-toggles" style="margin:10px 0;display:flex;flex-wrap:wrap;gap:8px;
+          align-items:center;font-size:.82em"></div>
+          <div class="tbl-scroll"><table>
+          <thead id="r-thead"></thead><tbody id="r-tbody"></tbody>
+          </table></div>
+          </section></div>
+
+          <script>
+          const COLORS=['#4285f4','#ea4335','#fbbc04','#34a853',
+          '#ff6d01','#46bdc6','#9c27b0','#795548'];
+          let charts={};
+          let lastRows=[];
+          let lastCols=[];
+
+          function loadSqlExample(){
+           var el=document.getElementById('f-sql');
+           el.value='SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date\\nFROM "gsi-export-test_db"."gsi_export"\\nWHERE report_date >= \\\'2025-01-01\\\'\\nORDER BY report_date DESC\\nLIMIT 50';
+           el.focus()}
+          function setTheme(t){document.documentElement.setAttribute('data-theme',t);
+           localStorage.setItem('cc-theme',t);
+           document.getElementById('theme-sel').value=t}
+          document.addEventListener('DOMContentLoaded',()=>{
+           var t=localStorage.getItem('cc-theme')||'light';
+           document.getElementById('theme-sel').value=t;
+           setupForm()});
+
+          function setupForm(){
+           const sel=document.getElementById('qt');
+           const groups=['p-by_date','p-by_date2','p-by_agent',
+            'p-by_contact','p-custom_sql'];
+           sel.addEventListener('change',()=>{
+            groups.forEach(g=>document.getElementById(g).classList.add('hide'));
+            const v=sel.value;
+            if(v==='by_date'||v==='daily_summary'||v==='channel_summary'){
+             document.getElementById('p-by_date').classList.remove('hide');
+             document.getElementById('p-by_date2').classList.remove('hide');}
+            if(v==='by_agent')
+             document.getElementById('p-by_agent').classList.remove('hide');
+            if(v==='by_contact')
+             document.getElementById('p-by_contact').classList.remove('hide');
+            if(v==='custom_sql')
+             document.getElementById('p-custom_sql').classList.remove('hide');
+           });
+           document.getElementById('run-btn').addEventListener('click',runQuery);
+          }
+
+          let lastQid=null;
+          async function runQuery(){
+           const st=document.getElementById('q-status');
+           const res=document.getElementById('q-results');
+           st.className='status status-load';st.textContent='Running query...';
+           st.classList.remove('hide');res.classList.add('hide');
+           document.getElementById('hint-text').classList.add('hide');
+           const body={query:document.getElementById('qt').value,
+            limit:+document.getElementById('f-limit').value};
+           if(body.query==='by_date'||body.query==='daily_summary'
+            ||body.query==='channel_summary'){
+            body.startDate=document.getElementById('f-sd').value;
+            body.endDate=document.getElementById('f-ed').value;}
+           if(body.query==='by_agent')
+            body.agentName=document.getElementById('f-agent').value;
+           else if(body.query==='by_contact')
+            body.contactId=document.getElementById('f-cid').value;
+           else if(body.query==='custom_sql')
+            body.sql=document.getElementById('f-sql').value;
+           try{
+            const r=await fetch('/api/query',{method:'POST',
+             headers:{'Content-Type':'application/json'},
+             body:JSON.stringify(body)});
+            const d=await r.json();
+            if(d.error){st.className='status status-err';
+             st.textContent='Error: '+d.error;return;}
+            lastQid=d.queryExecutionId;
+            const mb=(d.dataScannedBytes/1048576).toFixed(2);
+            st.className='status status-ok';
+            st.textContent='Done. Scanned: '+mb+' MB | Runtime: '+d.runtimeMs+' ms';
+            const rr=await fetch('/api/results?queryExecutionId='+lastQid);
+            const rows=await rr.json();
+            renderStats(rows);
+            renderTable(rows);
+            const dl=document.getElementById('dl-btn');
+            dl.classList.remove('hide');
+            dl.onclick=()=>downloadFilteredCsv();
+           }catch(e){st.className='status status-err';
+            st.textContent='Failed: '+e.message;}
+          }
+
+          function renderStats(rows){
+           if(!rows||!rows.length){
+            document.getElementById('stats-section').classList.add('hide');
+            document.getElementById('charts-section').classList.add('hide');
+            return;}
+           document.getElementById('stats-section').classList.remove('hide');
+           document.getElementById('charts-section').classList.remove('hide');
+           Object.values(charts).forEach(c=>c.destroy());charts={};
+
+           // stat cards
+           document.getElementById('s-total').textContent=
+            rows.length.toLocaleString();
+           const cids=new Set(rows.map(r=>r.contactid).filter(Boolean));
+           document.getElementById('s-contacts').textContent=
+            cids.size?cids.size.toLocaleString():rows.length.toLocaleString();
+           const chanSet=new Set(rows.map(r=>r.originalcontactchannel||r.channel).filter(Boolean));
+           document.getElementById('s-chan').textContent=chanSet.size||'--';
+           const agSet=new Set(rows.map(r=>r.agentname).filter(Boolean));
+           document.getElementById('s-agents').textContent=agSet.size||'--';
+
+           // contacts per day chart
+           const dayMap={};
+           rows.forEach(r=>{const d=r.report_date;
+            if(d){dayMap[d]=(dayMap[d]||0)+1}});
+           const days=Object.keys(dayMap).sort();
+           if(days.length) charts.daily=new Chart(document.getElementById('c-daily'),{
+            type:'bar',data:{labels:days,
+            datasets:[{label:'Contacts',data:days.map(d=>dayMap[d]),
+            backgroundColor:'#4285f4',borderRadius:4}]},
+            options:{responsive:true,plugins:{legend:{display:false}},
+            scales:{x:{ticks:{maxRotation:45}}}}});
+
+           // by channel chart
+           const chanMap={};
+           rows.forEach(r=>{const c=r.originalcontactchannel||r.channel;
+            if(c){chanMap[c]=(chanMap[c]||0)+1}});
+           const chans=Object.keys(chanMap);
+           if(chans.length) charts.chan=new Chart(document.getElementById('c-chan'),{
+            type:'doughnut',data:{labels:chans,
+            datasets:[{data:chans.map(c=>chanMap[c]),
+            backgroundColor:COLORS.slice(0,chans.length)}]},
+            options:{responsive:true}});
+
+           // by agent chart
+           const agMap={};
+           rows.forEach(r=>{const a=r.agentname;
+            if(a){agMap[a]=(agMap[a]||0)+1}});
+           const agents=Object.entries(agMap).sort((a,b)=>b[1]-a[1]).slice(0,15);
+           if(agents.length) charts.agent=new Chart(document.getElementById('c-agent'),{
+            type:'bar',data:{labels:agents.map(a=>a[0]),
+            datasets:[{label:'Contacts',data:agents.map(a=>a[1]),
+            backgroundColor:'#34a853',borderRadius:4}]},
+            options:{responsive:true,indexAxis:'y',
+            plugins:{legend:{display:false}}}});
+
+           // by initiation method chart
+           const imMap={};
+           rows.forEach(r=>{const m=r.initiationmethod;
+            if(m){imMap[m]=(imMap[m]||0)+1}});
+           const methods=Object.keys(imMap);
+           if(methods.length) charts.init=new Chart(document.getElementById('c-init'),{
+            type:'pie',data:{labels:methods,
+            datasets:[{data:methods.map(m=>imMap[m]),
+            backgroundColor:COLORS.slice(0,methods.length)}]},
+            options:{responsive:true}});
+          }
+
+          function renderTable(rows){
+           const res=document.getElementById('q-results');
+           const th=document.getElementById('r-thead');
+           const tb=document.getElementById('r-tbody');
+           const tog=document.getElementById('col-toggles');
+           if(!rows||!rows.length){
+            res.classList.remove('hide');
+            document.getElementById('q-count').textContent='No results';
+            th.innerHTML='';tb.innerHTML='';tog.innerHTML='';return;}
+           lastRows=rows;
+           lastCols=Object.keys(rows[0]);
+           document.getElementById('q-count').textContent=rows.length+' rows';
+           // column toggles
+           tog.innerHTML='<span style="color:var(--sub);font-weight:600">CSV Columns:</span>'+
+            '<button class="col-toggle-all" onclick="toggleAllCols(true)">All</button>'+
+            '<button class="col-toggle-all" style="background:#6c757d;border-color:#6c757d" onclick="toggleAllCols(false)">None</button>'+
+            lastCols.map(c=>'<label class="col-toggle"><input type="checkbox" checked value="'+c+'">'+c+'</label>').join('');
+           th.innerHTML='<tr>'+lastCols.map(c=>'<th>'+c+'</th>').join('')+'</tr>';
+           tb.innerHTML=rows.map(r=>'<tr>'+lastCols.map(c=>
+            '<td title="Click to copy" onclick="copyCell(this)">'+(r[c]||'')+'</td>').join('')+'</tr>').join('');
+           res.classList.remove('hide');
+          }
+          function toggleAllCols(on){
+           document.querySelectorAll('#col-toggles input[type=checkbox]')
+            .forEach(cb=>cb.checked=on)}
+          function downloadFilteredCsv(){
+           var cbs=document.querySelectorAll('#col-toggles input[type=checkbox]:checked');
+           var cols=Array.from(cbs).map(cb=>cb.value);
+           if(!cols.length){alert('Select at least one column for the CSV');return}
+           var esc=v=>{var s=String(v==null?'':v);
+            return s.includes(',')||s.includes('"')||s.includes('\\n')?
+            '"'+s.replace(/"/g,'""')+'"':s};
+           var csv=cols.join(',')+' \\n'+
+            lastRows.map(r=>cols.map(c=>esc(r[c])).join(',')).join('\\n');
+           var blob=new Blob([csv],{type:'text/csv'});
+           var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+           a.download='query_results.csv';a.click();URL.revokeObjectURL(a.href)}
+          function copyCell(el){
+           navigator.clipboard.writeText(el.textContent).then(()=>{
+            var tip=document.createElement('span');tip.className='copied-tip';
+            tip.textContent='Copied!';el.appendChild(tip);
+            setTimeout(()=>tip.remove(),1200)});
+          }
+          </script></body></html>"""
+
+  # -------------------------------------------------------------------------
+  # 9b. Lambda Function URL for Report Dashboard
+  # -------------------------------------------------------------------------
+  ReportDashboardUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ReportQueryFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - Content-Type
+
+  ReportDashboardUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReportQueryFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # -------------------------------------------------------------------------
+  # 10. CloudWatch Alarm
+  # -------------------------------------------------------------------------
+  ExportLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-export-errors'
+      AlarmDescription: GSI export Lambda is throwing errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExportLambdaFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  DynamoDBTable:
+    Condition: ShouldCreateTable
+    Value: !If
+      - CreateTableWithSK
+      - !Ref DynamoTableWithSK
+      - !Ref DynamoTableWithoutSK
+    Description: DynamoDB table created by this stack
+
+  ExportDataBucket:
+    Value: !Ref ExportDataBucket
+    Description: S3 bucket storing Parquet exports
+
+  AthenaResultsBucket:
+    Value: !Ref AthenaResultsBucket
+    Description: S3 bucket for Athena query results
+
+  AthenaWorkgroup:
+    Value: !Ref AthenaWorkgroup
+    Description: Use this workgroup in the Athena console
+
+  AthenaDatabase:
+    Value: !Sub '${AWS::StackName}_db'
+    Description: Athena database name
+
+  LambdaFunction:
+    Value: !Ref ExportLambdaFunction
+    Description: GSI exporter Lambda function name
+
+  EventBridgeRule:
+    Value: !Ref ExportScheduleRule
+    Description: EventBridge rule driving the export schedule
+
+  OnDemandExportFunction:
+    Value: !Ref OnDemandExportFunction
+    Description: >
+      Invoke this Lambda to export GSI data to S3 as Parquet on demand:
+      aws lambda invoke --function-name <value> --payload '{}' out.json
+
+  ReportQueryFunction:
+    Value: !Ref ReportQueryFunction
+    Description: >
+      Query Athena and get CSV results. Options: all_records, by_date,
+      by_agent, by_contact, daily_summary, custom_sql.
+      Example: aws lambda invoke --function-name <value>
+      --payload '{"query":"by_date","startDate":"2026-02-14",
+      "endDate":"2026-02-18","presignedUrl":true}' out.json
+
+  AthenaTable:
+    Value: !Sub '${AWS::StackName}_db.gsi_export'
+    Description: >
+      Athena table (auto-created). Database and table with partition
+      projection are set up automatically at deploy time.
+
+  ReportDashboardURL:
+    Value: !GetAtt ReportDashboardUrl.FunctionUrl
+    Description: >
+      Open this URL in a browser to access the contact center reporting
+      dashboard with statistics, query tools, and CSV downloads.
