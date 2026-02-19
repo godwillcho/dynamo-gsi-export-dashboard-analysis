@@ -1492,9 +1492,9 @@ Resources:
                   Params={'Bucket':p.netloc,'Key':p.path.lstrip('/')},
                   ExpiresIn=expiry)
 
-          def fetch_rows(qid, max_rows=500):
+          def fetch_rows(qid, max_rows=20000):
               rows, cols, kwargs = [], None, {
-                  'QueryExecutionId':qid,'MaxResults':100}
+                  'QueryExecutionId':qid,'MaxResults':1000}
               while len(rows) < max_rows:
                   r = athena.get_query_results(**kwargs)
                   rs = r['ResultSet']
