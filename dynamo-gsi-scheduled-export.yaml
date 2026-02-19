@@ -2121,6 +2121,13 @@ Resources:
       Principal: '*'
       FunctionUrlAuthType: NONE
 
+  ReportDashboardInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReportQueryFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: '*'
+
   # -------------------------------------------------------------------------
   # 10. CloudWatch Alarm
   # -------------------------------------------------------------------------
