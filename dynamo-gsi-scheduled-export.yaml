@@ -976,6 +976,8 @@ Resources:
       Description: Workgroup for querying DynamoDB GSI export data
       State: ENABLED
       WorkGroupConfiguration:
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
         ResultConfiguration:
           OutputLocation: !Sub 's3://${AthenaResultsBucket}/results/'
           EncryptionConfiguration:
