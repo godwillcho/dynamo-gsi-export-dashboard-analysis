@@ -22,7 +22,7 @@ from botocore.exceptions import ClientError
 # ---------------------------------------------------------------------------
 # Configuration — edit these to match your deployment
 # ---------------------------------------------------------------------------
-STACK_NAME = "gsi-export-test"  # Must be lowercase (used in S3 bucket names)
+STACK_NAME = "gsi-export"  # Must be lowercase (used in S3 bucket names)
 TEMPLATE_FILE = "dynamo-gsi-scheduled-export.yaml"
 REGION = "us-east-1"  # Set explicitly; change to your preferred region
 
@@ -36,10 +36,7 @@ PARAMETERS = {
     "S3DataPrefix":             "exports",
     "CronExpression":           "rate(1 day)",
     "DateRangeMode":            "PREVIOUS_DAY",
-    "CreateTable":              "true",
-    "TablePKName":              "ContactId",
-    "TablePKType":              "S",
-    "BillingMode":              "PAY_PER_REQUEST",
+    "CreateTable":              "false",
     "ExtraDateColumn":          "report_date",
 }
 
