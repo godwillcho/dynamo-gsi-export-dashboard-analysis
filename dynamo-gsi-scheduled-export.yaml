@@ -1183,7 +1183,7 @@ Resources:
 
           athena = boto3.client('athena')
 
-          DATABASE  = os.environ['ATHENA_DATABASE']
+          DATABASE  = os.environ['ATHENA_DATABASE'].replace('-', '_')
           WORKGROUP = os.environ['ATHENA_WORKGROUP']
           LOCATION  = os.environ['TABLE_LOCATION']
           YR_RANGE  = os.environ['YEAR_RANGE']
@@ -1240,7 +1240,7 @@ Resources:
               logger.info("CustomResource %s — db=%s",
                           rt, DATABASE)
               try:
-                  db = f'"{DATABASE}"'
+                  db = DATABASE
 
                   if rt in ('Create', 'Update'):
                       run_ddl(
@@ -1435,10 +1435,10 @@ Resources:
           logger = logging.getLogger(__name__)
           logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
 
-          DATABASE  = os.environ['ATHENA_DATABASE']
+          DATABASE  = os.environ['ATHENA_DATABASE'].replace('-', '_')
           TABLE     = os.environ['ATHENA_TABLE']
           WORKGROUP = os.environ['ATHENA_WORKGROUP']
-          TBL       = f'"{DATABASE}"."{TABLE}"'
+          TBL       = f'{DATABASE}.{TABLE}'
 
           athena = boto3.client('athena')
           s3     = boto3.client('s3')
@@ -1854,7 +1854,7 @@ Resources:
           <button class="btn btn-blue" style="padding:6px 14px;font-size:.82em"
           onclick="loadSqlExample()">Load Example</button>
           </div>
-          <div class="sql-example" onclick="loadSqlExample()" title="Click to load into editor">SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date FROM "gsi-export-test_db"."gsi_export" WHERE report_date >= '2025-01-01' ORDER BY report_date DESC LIMIT 50</div>
+          <div class="sql-example" onclick="loadSqlExample()" title="Click to load into editor">SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date FROM gsi_export_test_db.gsi_export WHERE report_date >= '2025-01-01' ORDER BY report_date DESC LIMIT 50</div>
           </div>
           <label>Limit<input type="number" id="f-limit" value="1000" min="1" max="10000"
           style="width:80px"></label>
@@ -1908,7 +1908,7 @@ Resources:
 
           function loadSqlExample(){
            var el=document.getElementById('f-sql');
-           el.value='SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date\\nFROM "gsi-export-test_db"."gsi_export"\\nWHERE report_date >= \\\'2025-01-01\\\'\\nORDER BY report_date DESC\\nLIMIT 50';
+           el.value='SELECT contactid, agentname, originalcontactchannel, initiationmethod, report_date\\nFROM gsi_export_test_db.gsi_export\\nWHERE report_date >= \\\'2025-01-01\\\'\\nORDER BY report_date DESC\\nLIMIT 50';
            el.focus()}
           function setTheme(t){document.documentElement.setAttribute('data-theme',t);
            localStorage.setItem('cc-theme',t);
