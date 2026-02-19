@@ -22,7 +22,7 @@ from botocore.exceptions import ClientError
 # ---------------------------------------------------------------------------
 # Configuration — edit these to match your deployment
 # ---------------------------------------------------------------------------
-STACK_NAME = "gsi-export-test"
+STACK_NAME = "gsi-export-test"  # Must be lowercase (used in S3 bucket names)
 TEMPLATE_FILE = "dynamo-gsi-scheduled-export.yaml"
 REGION = "us-east-1"  # Set explicitly; change to your preferred region
 
@@ -61,7 +61,7 @@ def get_account_id():
     return sts.get_caller_identity()["Account"]
 
 def get_staging_bucket():
-    return f"cfn-templates-{get_account_id()}"
+    return f"cfn-templates-{get_account_id()}".lower()
 
 def get_clients():
     kwargs = _region_kwargs()
@@ -98,7 +98,7 @@ def build_params():
     if S3_BUCKET_NAME:
         params["S3BucketName"] = S3_BUCKET_NAME
     else:
-        params["S3BucketName"] = f"{STACK_NAME}-{get_account_id()}"
+        params["S3BucketName"] = f"{STACK_NAME}-{get_account_id()}".lower()
     return [
         {"ParameterKey": k, "ParameterValue": str(v)}
         for k, v in params.items()
