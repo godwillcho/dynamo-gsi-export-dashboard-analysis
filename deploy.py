@@ -36,9 +36,10 @@ PARAMETERS = {
     "S3DataPrefix":             "exports",
     "CronExpression":           "rate(1 day)",
     "DateRangeMode":            "LAST_N_HOURS",
-    "LookbackHours":            "24",
+    "LookbackHours":            "720",
     "CreateTable":              "false",
     "ExtraDateColumn":          "report_date",
+    "QuestionColumnSuffix":     "_Question",
 }
 
 # S3BucketName defaults to <stack>-<account> if not set here
