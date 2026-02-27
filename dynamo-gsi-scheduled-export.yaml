@@ -108,6 +108,17 @@ Parameters:
       from the GSI sort key. Makes Athena date filtering easy. Leave blank
       to skip.
 
+  # --- Q/A View (BI unpivot) ---
+  QuestionColumnSuffix:
+    Type: String
+    Default: ''
+    Description: >
+      Suffix that identifies question-text columns (e.g. '_Question').
+      The answer column is the question column name minus this suffix.
+      Example: column 'WelcomeGuide_Q2_Question' (question text) pairs
+      with 'WelcomeGuide_Q2' (answer value), topic = 'WELCOMEGUIDE_Q2'.
+      Leave empty to disable automatic Q/A view generation.
+
   # --- Schedule ---
   CronExpression:
     Type: String
@@ -325,6 +336,8 @@ Resources:
                 Action:
                   - glue:GetTable
                   - glue:UpdateTable
+                  - glue:CreateTable
+                  - glue:DeleteTable
                 Resource:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
@@ -371,6 +384,7 @@ Resources:
           EXTRA_DATE_COLUMN: !Ref ExtraDateColumn
           ATHENA_DATABASE:   !Sub '${AWS::StackName}_db'
           ATHENA_WORKGROUP:  !Ref AthenaWorkgroup
+          QUESTION_SUFFIX:   !Ref QuestionColumnSuffix
           LOG_LEVEL:         'INFO'
       Code:
         ZipFile: |
@@ -546,10 +560,25 @@ Resources:
               logger.info("Wrote %d row(s) to %s", len(df), s3_path)
 
 
+          def _run_athena_ddl(sql, db, wg):
+              """Execute an Athena DDL statement and wait for completion."""
+              athena_cl = boto3.client('athena')
+              r = athena_cl.start_query_execution(
+                  QueryString=sql, WorkGroup=wg)
+              qid = r['QueryExecutionId']
+              import time as _time
+              for _ in range(30):
+                  _time.sleep(1)
+                  ex = athena_cl.get_query_execution(QueryExecutionId=qid)
+                  st = ex['QueryExecution']['Status']['State']
+                  if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                      break
+              return st
+
+
           def sync_athena_schema(all_columns):
               """Add any new columns to the Athena table."""
               try:
-                  athena_client = boto3.client('athena')
                   db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
                   wg = os.environ.get('ATHENA_WORKGROUP', '')
                   if not db or not wg:
@@ -570,21 +599,73 @@ Resources:
                       ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
                              f"({', '.join(new_cols)})")
                       logger.info("Adding %d new columns: %s", len(new_cols), new_cols)
-                      r = athena_client.start_query_execution(
-                          QueryString=ddl, WorkGroup=wg)
-                      qid = r['QueryExecutionId']
-                      import time as _time
-                      for _ in range(30):
-                          _time.sleep(1)
-                          ex = athena_client.get_query_execution(QueryExecutionId=qid)
-                          st = ex['QueryExecution']['Status']['State']
-                          if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
-                              break
+                      st = _run_athena_ddl(ddl, db, wg)
                       logger.info("ALTER TABLE result: %s", st)
                   else:
                       logger.info("Athena schema up to date — no new columns")
               except Exception as e:
                   logger.warning("Schema sync failed (non-fatal): %s", e)
+
+
+          def create_qa_view():
+              """Auto-generate an Athena view that unpivots Q/A columns.
+              Question columns end with QUESTION_SUFFIX (e.g. _question).
+              Answer column = question column minus the suffix.
+              Topic = answer column name uppercased.
+              """
+              q_suffix = os.environ.get('QUESTION_SUFFIX', '').strip().lower()
+              if not q_suffix:
+                  return
+              try:
+                  db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
+                  wg = os.environ.get('ATHENA_WORKGROUP', '')
+                  if not db or not wg:
+                      return
+                  glue = boto3.client('glue')
+                  resp = glue.get_table(DatabaseName=db, Name='gsi_export')
+                  col_set = {c['Name'] for c in
+                             resp['Table']['StorageDescriptor']['Columns']}
+                  partitions = {c['Name'] for c in
+                                resp['Table'].get('PartitionKeys', [])}
+                  pairs = []
+                  q_and_a_cols = set()
+                  for col in sorted(col_set):
+                      if col in partitions:
+                          continue
+                      if col.endswith(q_suffix):
+                          a_col = col[:-len(q_suffix)]
+                          if a_col in col_set:
+                              topic = a_col.upper()
+                              pairs.append((topic, col, a_col))
+                              q_and_a_cols.add(col)
+                              q_and_a_cols.add(a_col)
+                  if not pairs:
+                      logger.info("No Q/A column pairs found, skipping view")
+                      return
+                  passthrough = [c for c in sorted(col_set)
+                                 if c not in partitions
+                                 and c not in q_and_a_cols]
+                  labels = ', '.join(f"'{p[0]}'" for p in pairs)
+                  q_refs = ', '.join(f'"{p[1]}"' for p in pairs)
+                  a_refs = ', '.join(f'"{p[2]}"' for p in pairs)
+                  pt_cols = ', '.join(f'"{c}"' for c in passthrough)
+                  sep = ', ' if pt_cols else ''
+                  view_sql = (
+                      f'CREATE OR REPLACE VIEW "{db}"."qa_map" AS '
+                      f'SELECT {pt_cols}{sep}'
+                      f't.topic, t.question, t.answer '
+                      f'FROM "{db}"."gsi_export" '
+                      f'CROSS JOIN UNNEST('
+                      f'ARRAY[{labels}], '
+                      f'ARRAY[{q_refs}], '
+                      f'ARRAY[{a_refs}]'
+                      f') AS t(topic, question, answer) '
+                      f'WHERE t.question IS NOT NULL '
+                      f'OR t.answer IS NOT NULL')
+                  st = _run_athena_ddl(view_sql, db, wg)
+                  logger.info("qa_map view: %s (%d pairs)", st, len(pairs))
+              except Exception as e:
+                  logger.warning("Q/A view creation failed (non-fatal): %s", e)
 
 
           def handler(event, context):
@@ -657,6 +738,7 @@ Resources:
               if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
                   all_cols[EXTRA_DATE_COL] = 'STRING'
               sync_athena_schema(all_cols)
+              create_qa_view()
 
               return {
                   'statusCode': 200,
@@ -776,6 +858,8 @@ Resources:
                 Action:
                   - glue:GetTable
                   - glue:UpdateTable
+                  - glue:CreateTable
+                  - glue:DeleteTable
                 Resource:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
@@ -839,6 +923,7 @@ Resources:
           EXTRA_DATE_COLUMN:       !Ref ExtraDateColumn
           ATHENA_DATABASE:         !Sub '${AWS::StackName}_db'
           ATHENA_WORKGROUP:        !Ref AthenaWorkgroup
+          QUESTION_SUFFIX:         !Ref QuestionColumnSuffix
           LOG_LEVEL:               'INFO'
       Code:
         ZipFile: |
@@ -1091,10 +1176,24 @@ Resources:
               logger.info("Wrote %d row(s) to %s", len(df), s3_path)
 
 
+          def _run_athena_ddl(sql, db, wg):
+              """Execute an Athena DDL statement and wait for completion."""
+              athena_cl = boto3.client('athena')
+              r = athena_cl.start_query_execution(
+                  QueryString=sql, WorkGroup=wg)
+              qid = r['QueryExecutionId']
+              for _ in range(30):
+                  time.sleep(1)
+                  ex = athena_cl.get_query_execution(QueryExecutionId=qid)
+                  st = ex['QueryExecution']['Status']['State']
+                  if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                      break
+              return st
+
+
           def sync_athena_schema(all_columns):
               """Add any new columns to the Athena table."""
               try:
-                  athena_client = boto3.client('athena')
                   db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
                   wg = os.environ.get('ATHENA_WORKGROUP', '')
                   if not db or not wg:
@@ -1112,20 +1211,73 @@ Resources:
                       ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
                              f"({', '.join(new_cols)})")
                       logger.info("Adding %d new columns: %s", len(new_cols), new_cols)
-                      r = athena_client.start_query_execution(
-                          QueryString=ddl, WorkGroup=wg)
-                      qid = r['QueryExecutionId']
-                      for _ in range(30):
-                          time.sleep(1)
-                          ex = athena_client.get_query_execution(QueryExecutionId=qid)
-                          st = ex['QueryExecution']['Status']['State']
-                          if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
-                              break
+                      st = _run_athena_ddl(ddl, db, wg)
                       logger.info("ALTER TABLE result: %s", st)
                   else:
                       logger.info("Athena schema up to date — no new columns")
               except Exception as e:
                   logger.warning("Schema sync failed (non-fatal): %s", e)
+
+
+          def create_qa_view():
+              """Auto-generate an Athena view that unpivots Q/A columns.
+              Question columns end with QUESTION_SUFFIX (e.g. _question).
+              Answer column = question column minus the suffix.
+              Topic = answer column name uppercased.
+              """
+              q_suffix = os.environ.get('QUESTION_SUFFIX', '').strip().lower()
+              if not q_suffix:
+                  return
+              try:
+                  db = os.environ.get('ATHENA_DATABASE', '').replace('-', '_')
+                  wg = os.environ.get('ATHENA_WORKGROUP', '')
+                  if not db or not wg:
+                      return
+                  glue = boto3.client('glue')
+                  resp = glue.get_table(DatabaseName=db, Name='gsi_export')
+                  col_set = {c['Name'] for c in
+                             resp['Table']['StorageDescriptor']['Columns']}
+                  partitions = {c['Name'] for c in
+                                resp['Table'].get('PartitionKeys', [])}
+                  pairs = []
+                  q_and_a_cols = set()
+                  for col in sorted(col_set):
+                      if col in partitions:
+                          continue
+                      if col.endswith(q_suffix):
+                          a_col = col[:-len(q_suffix)]
+                          if a_col in col_set:
+                              topic = a_col.upper()
+                              pairs.append((topic, col, a_col))
+                              q_and_a_cols.add(col)
+                              q_and_a_cols.add(a_col)
+                  if not pairs:
+                      logger.info("No Q/A column pairs found, skipping view")
+                      return
+                  passthrough = [c for c in sorted(col_set)
+                                 if c not in partitions
+                                 and c not in q_and_a_cols]
+                  labels = ', '.join(f"'{p[0]}'" for p in pairs)
+                  q_refs = ', '.join(f'"{p[1]}"' for p in pairs)
+                  a_refs = ', '.join(f'"{p[2]}"' for p in pairs)
+                  pt_cols = ', '.join(f'"{c}"' for c in passthrough)
+                  sep = ', ' if pt_cols else ''
+                  view_sql = (
+                      f'CREATE OR REPLACE VIEW "{db}"."qa_map" AS '
+                      f'SELECT {pt_cols}{sep}'
+                      f't.topic, t.question, t.answer '
+                      f'FROM "{db}"."gsi_export" '
+                      f'CROSS JOIN UNNEST('
+                      f'ARRAY[{labels}], '
+                      f'ARRAY[{q_refs}], '
+                      f'ARRAY[{a_refs}]'
+                      f') AS t(topic, question, answer) '
+                      f'WHERE t.question IS NOT NULL '
+                      f'OR t.answer IS NOT NULL')
+                  st = _run_athena_ddl(view_sql, db, wg)
+                  logger.info("qa_map view: %s (%d pairs)", st, len(pairs))
+              except Exception as e:
+                  logger.warning("Q/A view creation failed (non-fatal): %s", e)
 
 
           # ── handler ───────────────────────────────────────────────────────
@@ -1152,6 +1304,7 @@ Resources:
               if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
                   all_cols[EXTRA_DATE_COL] = 'STRING'
               sync_athena_schema(all_cols)
+              create_qa_view()
 
               logger.info("Invocation complete — request_id=%s items=%d s3_key=%s",
                           request_id, len(items), s3_key)
@@ -1397,6 +1550,7 @@ Resources:
           GSI_PK_ATTRIBUTE: !Ref GsiPartitionKeyAttribute
           GSI_PK_VALUE: !Ref GsiPartitionKeyValue
           EXTRA_DATE_COLUMN: !Ref ExtraDateColumn
+          QUESTION_SUFFIX: !Ref QuestionColumnSuffix
       Code:
         ZipFile: |
           """
@@ -1436,21 +1590,21 @@ Resources:
               from boto3.dynamodb.conditions import Key
               all_attrs = {}
               try:
-                  resp = table.query(
-                      IndexName=GSI_NAME,
-                      KeyConditionExpression=Key(GSI_PK_ATTR).eq(GSI_PK_VALUE),
-                      Limit=200,
-                  )
-                  items = resp.get('Items', [])
-                  # Also try to get more diversity with a second page
-                  if resp.get('LastEvaluatedKey'):
-                      resp2 = table.query(
+                  items = []
+                  last_key = None
+                  for _ in range(25):  # up to 25 pages x 200 = 5000 items
+                      query_args = dict(
                           IndexName=GSI_NAME,
                           KeyConditionExpression=Key(GSI_PK_ATTR).eq(GSI_PK_VALUE),
-                          ExclusiveStartKey=resp['LastEvaluatedKey'],
                           Limit=200,
                       )
-                      items.extend(resp2.get('Items', []))
+                      if last_key:
+                          query_args['ExclusiveStartKey'] = last_key
+                      resp = table.query(**query_args)
+                      items.extend(resp.get('Items', []))
+                      last_key = resp.get('LastEvaluatedKey')
+                      if not last_key:
+                          break
 
                   for item in items:
                       for k, v in item.items():
@@ -1496,6 +1650,65 @@ Resources:
                       f"DDL {state}: {reason}")
               logger.info("DDL succeeded: %s", qid)
               return qid
+
+
+          def create_qa_view(db):
+              """Auto-generate an Athena view that unpivots Q/A columns.
+              Question columns end with QUESTION_SUFFIX (e.g. _question).
+              Answer column = question column minus the suffix.
+              Topic = answer column name uppercased.
+              """
+              q_suffix = os.environ.get('QUESTION_SUFFIX', '').strip().lower()
+              if not q_suffix:
+                  logger.info("Q/A view disabled (no suffix configured)")
+                  return
+              try:
+                  glue = boto3.client('glue')
+                  resp = glue.get_table(DatabaseName=db, Name='gsi_export')
+                  col_set = {c['Name'] for c in
+                             resp['Table']['StorageDescriptor']['Columns']}
+                  partitions = {c['Name'] for c in
+                                resp['Table'].get('PartitionKeys', [])}
+                  pairs = []
+                  q_and_a_cols = set()
+                  for col in sorted(col_set):
+                      if col in partitions:
+                          continue
+                      if col.endswith(q_suffix):
+                          a_col = col[:-len(q_suffix)]
+                          if a_col in col_set:
+                              topic = a_col.upper()
+                              pairs.append((topic, col, a_col))
+                              q_and_a_cols.add(col)
+                              q_and_a_cols.add(a_col)
+                  if not pairs:
+                      logger.info("No Q/A column pairs found, skipping view")
+                      return
+                  passthrough = [c for c in sorted(col_set)
+                                 if c not in partitions
+                                 and c not in q_and_a_cols]
+                  labels = ', '.join(f"'{p[0]}'" for p in pairs)
+                  q_refs = ', '.join(f'"{p[1]}"' for p in pairs)
+                  a_refs = ', '.join(f'"{p[2]}"' for p in pairs)
+                  pt_cols = ', '.join(f'"{c}"' for c in passthrough)
+                  sep = ', ' if pt_cols else ''
+                  view_sql = (
+                      f'CREATE OR REPLACE VIEW "{db}"."qa_map" AS '
+                      f'SELECT {pt_cols}{sep}'
+                      f't.topic, t.question, t.answer '
+                      f'FROM "{db}"."gsi_export" '
+                      f'CROSS JOIN UNNEST('
+                      f'ARRAY[{labels}], '
+                      f'ARRAY[{q_refs}], '
+                      f'ARRAY[{a_refs}]'
+                      f') AS t(topic, question, answer) '
+                      f'WHERE t.question IS NOT NULL '
+                      f'OR t.answer IS NOT NULL')
+                  run_ddl(view_sql)
+                  logger.info("Created qa_map view with %d Q/A pairs",
+                              len(pairs))
+              except Exception as e:
+                  logger.warning("Q/A view creation failed (non-fatal): %s", e)
 
 
           def send_cfn(event, context, status, reason=''):
@@ -1576,6 +1789,9 @@ Resources:
             'storage.location.template'=
               '{loc}year=${{year}}/month=${{month}}/day=${{day}}'
           )""")
+
+                      # Auto-generate Q/A view if suffixes are configured
+                      create_qa_view(db)
 
                   elif rt == 'Delete':
                       try:
@@ -2504,6 +2720,13 @@ Outputs:
     Description: >
       Athena table (auto-created). Database and table with partition
       projection are set up automatically at deploy time.
+
+  AthenaQAView:
+    Value: !Sub '${AWS::StackName}_db.qa_map'
+    Description: >
+      Athena Q/A view (long format) for BI tools. Automatically generated
+      when QuestionColumnSuffix is configured (e.g., _Question).
+      Query: SELECT * FROM "<stack>_db"."qa_map" LIMIT 100
 
   ReportDashboardURL:
     Value: !GetAtt ReportDashboardUrl.FunctionUrl
