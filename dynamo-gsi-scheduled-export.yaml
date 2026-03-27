@@ -594,7 +594,7 @@ Resources:
                   new_cols = []
                   for col, dtype in all_columns.items():
                       if col.lower() not in existing:
-                          new_cols.append(f'{col.lower()} {dtype}')
+                          new_cols.append(f'`{col.lower()}` {dtype}')
                   if new_cols:
                       ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
                              f"({', '.join(new_cols)})")
@@ -1182,8 +1182,9 @@ Resources:
               r = athena_cl.start_query_execution(
                   QueryString=sql, WorkGroup=wg)
               qid = r['QueryExecutionId']
+              import time as _time
               for _ in range(30):
-                  time.sleep(1)
+                  _time.sleep(1)
                   ex = athena_cl.get_query_execution(QueryExecutionId=qid)
                   st = ex['QueryExecution']['Status']['State']
                   if st in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
@@ -1206,7 +1207,7 @@ Resources:
                   new_cols = []
                   for col, dtype in all_columns.items():
                       if col.lower() not in existing:
-                          new_cols.append(f'{col.lower()} {dtype}')
+                          new_cols.append(f'`{col.lower()}` {dtype}')
                   if new_cols:
                       ddl = (f"ALTER TABLE {db}.gsi_export ADD COLUMNS "
                              f"({', '.join(new_cols)})")
@@ -1288,8 +1289,43 @@ Resources:
 
               start_dt, end_dt = compute_date_range()
               items  = query_gsi(start_dt, end_dt)
-              s3_key = build_s3_key(start_dt, end_dt)
-              write_parquet(items, s3_key)
+
+              if not items:
+                  logger.warning("No items found.")
+                  return {'statusCode': 200, 'itemCount': 0, 's3Keys': []}
+
+              # Group items by date and write one Parquet file per day partition
+              from datetime import date
+              s3_keys = []
+              items_by_date = {}
+              for item in items:
+                  sk_val = item.get(GSI_SK_ATTR, '')
+                  try:
+                      if DATE_FORMAT == 'EPOCH':
+                          dt = datetime.fromtimestamp(float(sk_val), tz=timezone.utc)
+                      elif DATE_FORMAT == 'HUMAN_READABLE':
+                          dt = parse_human_date(str(sk_val))
+                      else:
+                          dt = datetime.fromisoformat(str(sk_val).replace('Z', '+00:00'))
+                      day_key = dt.date()
+                  except Exception:
+                      day_key = date.today()
+                  items_by_date.setdefault(day_key, []).append(item)
+
+              logger.info("Items span %d day partition(s)", len(items_by_date))
+
+              for day, day_items in sorted(items_by_date.items()):
+                  if OVERWRITE_MODE == 'OVERWRITE':
+                      filename = 'data.parquet'
+                  else:
+                      filename = (
+                          f"{datetime.now(timezone.utc).strftime('%H%M%S')}"
+                          f"-{uuid.uuid4().hex[:8]}.parquet"
+                      )
+                  s3_key = (f"{S3_PREFIX}/year={day.year}"
+                            f"/month={day.month:02d}/day={day.day:02d}/{filename}")
+                  write_parquet(day_items, s3_key)
+                  s3_keys.append(s3_key)
 
               # Sync Athena schema with discovered columns
               all_cols = {}
@@ -1306,13 +1342,13 @@ Resources:
               sync_athena_schema(all_cols)
               create_qa_view()
 
-              logger.info("Invocation complete — request_id=%s items=%d s3_key=%s",
-                          request_id, len(items), s3_key)
+              logger.info("Invocation complete — request_id=%s items=%d files=%d",
+                          request_id, len(items), len(s3_keys))
 
               return {
                   'statusCode': 200,
                   'itemCount': len(items),
-                  's3Key': s3_key,
+                  's3Keys': s3_keys,
               }
 
   # -------------------------------------------------------------------------

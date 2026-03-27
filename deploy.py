@@ -36,7 +36,7 @@ PARAMETERS = {
     "S3DataPrefix":             "exports",
     "CronExpression":           "rate(1 day)",
     "DateRangeMode":            "LAST_N_HOURS",
-    "LookbackHours":            "720",
+    "LookbackHours":            "48",
     "CreateTable":              "false",
     "ExtraDateColumn":          "report_date",
     "QuestionColumnSuffix":     "_Question",
