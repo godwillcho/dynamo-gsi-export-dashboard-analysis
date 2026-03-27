@@ -526,7 +526,7 @@ Resources:
               for item in items:
                   flat = {}
                   for k, v in item.items():
-                      flat[k.lower()] = flatten_value(v)
+                      flat[k.lower().replace(' ', '_')] = flatten_value(v)
                   flat_items.append(flat)
 
               df = pd.DataFrame(flat_items)
@@ -729,12 +729,13 @@ Resources:
               all_cols = {}
               for item in items:
                   for k, v in item.items():
-                      if k not in all_cols:
+                      col = k.lower().replace(' ', '_')
+                      if col not in all_cols:
                           from decimal import Decimal as _Dec
                           if isinstance(v, (int, float, _Dec)):
-                              all_cols[k] = 'DOUBLE'
+                              all_cols[col] = 'DOUBLE'
                           else:
-                              all_cols[k] = 'STRING'
+                              all_cols[col] = 'STRING'
               if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
                   all_cols[EXTRA_DATE_COL] = 'STRING'
               sync_athena_schema(all_cols)
@@ -1136,7 +1137,7 @@ Resources:
               for item in items:
                   flat = {}
                   for k, v in item.items():
-                      flat[k.lower()] = flatten_value(v)
+                      flat[k.lower().replace(' ', '_')] = flatten_value(v)
                   flat_items.append(flat)
 
               df = pd.DataFrame(flat_items)
@@ -1331,12 +1332,13 @@ Resources:
               all_cols = {}
               for item in items:
                   for k, v in item.items():
-                      if k not in all_cols:
+                      col = k.lower().replace(' ', '_')
+                      if col not in all_cols:
                           from decimal import Decimal as _Dec
                           if isinstance(v, (int, float, _Dec)):
-                              all_cols[k] = 'DOUBLE'
+                              all_cols[col] = 'DOUBLE'
                           else:
-                              all_cols[k] = 'STRING'
+                              all_cols[col] = 'STRING'
               if EXTRA_DATE_COL and EXTRA_DATE_COL not in all_cols:
                   all_cols[EXTRA_DATE_COL] = 'STRING'
               sync_athena_schema(all_cols)
@@ -1644,11 +1646,12 @@ Resources:
 
                   for item in items:
                       for k, v in item.items():
-                          if k not in all_attrs:
+                          col = k.lower().replace(' ', '_')
+                          if col not in all_attrs:
                               if isinstance(v, (int, float, Decimal)):
-                                  all_attrs[k] = 'DOUBLE'
+                                  all_attrs[col] = 'DOUBLE'
                               else:
-                                  all_attrs[k] = 'STRING'
+                                  all_attrs[col] = 'STRING'
 
                   logger.info("Discovered %d columns from %d items: %s",
                               len(all_attrs), len(items), list(all_attrs.keys()))
@@ -1794,7 +1797,7 @@ Resources:
                           cols.pop(pc, None)
 
                       col_defs = ',\n            '.join(
-                          f'{k.lower()} {v}' for k, v in cols.items())
+                          f'`{k.lower().replace(" ", "_")}` {v}' for k, v in cols.items())
                       logger.info("Creating table with %d columns", len(cols))
 
                       # Drop existing table first to refresh schema
